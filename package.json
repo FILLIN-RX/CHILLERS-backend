@@ -1,0 +1,57 @@
+{
+  "name": "chiller-backend",
+  "version": "1.0.0",
+  "description": "Chiller streaming platform backend - Secure gateway to TMDB API",
+  "main": "dist/server.js",
+  "scripts": {
+    "start": "node dist/server.js",
+    "build": "tsc && cp src/scraping/core/scrape-films.js dist/scraping/core/scrape-films.js && cp src/scraping/core/uploaded.json dist/scraping/core/uploaded.json && cp src/scraping/core/series-output.json dist/scraping/core/series-output.json && npx playwright install chromium",
+    "dev": "tsx watch src/server.ts",
+    "preview": "node dist/server.js",
+    "upload": "npx tsx src/scripts/upload-doodstream.ts",
+    "upload-uqload": "npx tsx src/scripts/upload-uqload.ts",
+    "upload-uqload:verify": "npx tsx src/scripts/upload-uqload.ts --verify",
+    "upload-series": "npx tsx src/scripts/upload-series-doodstream.ts",
+    "organize-series": "npx tsx src/scripts/organize-series.ts",
+    "check-status": "npx tsx src/scripts/check-upload-status.ts"
+  },
+  "keywords": [
+    "chiller",
+    "streaming",
+    "tmdb",
+    "api"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "@types/node-cron": "^3.0.11",
+    "axios": "^1.18.1",
+    "bcryptjs": "^3.0.3",
+    "cors": "^2.8.6",
+    "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "helmet": "^7.2.0",
+    "jsonwebtoken": "^9.0.3",
+    "lru-cache": "^11.5.2",
+    "mongodb": "^7.5.0",
+    "mongoose": "^9.7.4",
+    "morgan": "^1.11.0",
+    "node-cron": "^4.6.0",
+    "nodemailer": "^9.0.3",
+    "playwright": "^1.61.1"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.61.1",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/morgan": "^1.9.10",
+    "@types/node": "^26.1.1",
+    "@types/nodemailer": "^8.0.1",
+    "nodemon": "^3.1.14",
+    "ts-node": "^10.9.2",
+    "tsx": "^4.23.1",
+    "typescript": "^7.0.2"
+  }
+}
