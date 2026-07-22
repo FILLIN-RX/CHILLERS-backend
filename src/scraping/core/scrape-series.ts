@@ -71,11 +71,21 @@ async function scrapeSeriesDetails() {
     const apiKey = process.env.UQLOAD_API_KEY;
     const uqload = apiKey ? new UqloadClient(apiKey) : null;
 
+    let shuttingDown = false;
+    process.on('SIGTERM', async () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        console.log('\n[SIGTERM] Arrêt demandé, fermeture du navigateur...');
+        await browser.close().catch(() => {});
+        await mongoose.disconnect().catch(() => {});
+        process.exit(0);
+    });
+
     const state = await loadState();
     let currentPage = state.lastPage;
     let hasMorePages = true;
 
-    while (hasMorePages) {
+    while (hasMorePages && !shuttingDown) {
         const url = `https://www.open-otaku.me/?cat=series&page=${currentPage}`;
         console.log(`\n--- Navigation vers ${url} ---`);
 

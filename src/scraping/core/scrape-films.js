@@ -81,11 +81,21 @@ async function scrapeFilms() {
     const apiKey = process.env.UQLOAD_API_KEY;
     const uqload = apiKey ? new UqloadClient(apiKey) : null;
 
+    let shuttingDown = false;
+    process.on('SIGTERM', async () => {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        console.log('\n[SIGTERM] Arrêt demandé, fermeture du navigateur...');
+        await browser.close().catch(() => {});
+        await mongoose.disconnect().catch(() => {});
+        process.exit(0);
+    });
+
     let currentPage = await getLastPage();
     let hasMorePages = true;
     console.log(`Reprise à la page ${currentPage}`);
 
-    while (hasMorePages) {
+    while (hasMorePages && !shuttingDown) {
         const url = `https://www.open-otaku.me/?cat=films&page=${currentPage}`;
         console.log(`\n--- Navigation vers ${url} ---`);
         

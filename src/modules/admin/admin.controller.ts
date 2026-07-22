@@ -541,6 +541,25 @@ export async function runningTasks(_req: AuthRequest, res: Response) {
 
 export async function stopTaskHandler(req: AuthRequest, res: Response) {
     const name = Array.isArray(req.params.name) ? req.params.name[0] : req.params.name;
+    if (SCRAPER_API_URL) {
+        try {
+            const token = req.headers.authorization?.startsWith('Bearer ')
+                ? req.headers.authorization.split(' ')[1]
+                : req.query.token;
+            const response = await axios({
+                method: 'post',
+                url: `${SCRAPER_API_URL}/api/admin/tasks/stop/${encodeURIComponent(name)}`,
+                params: { token },
+                headers: { 'Content-Type': 'application/json' },
+                timeout: 5000,
+            });
+            res.json(response.data);
+        } catch (e: any) {
+            console.error(`[ScraperProxy] Erreur arrêt distant ${SCRAPER_API_URL}:`, e.message);
+            res.status(502).json({ success: false, data: null, message: `Scraper injoignable: ${e.message}` });
+        }
+        return;
+    }
     const killed = stopTask(name);
     res.json({ success: true, data: { killed, name }, message: killed ? null : `Aucune tâche en cours: ${name}` });
 }
