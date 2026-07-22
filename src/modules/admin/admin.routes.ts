@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { adminMiddleware } from './admin.middleware';
+import { adminMiddleware, adminSseMiddleware } from './admin.middleware';
 import * as adminController from './admin.controller';
 
 const router = Router();
@@ -26,7 +26,7 @@ router.get('/cron/system', adminMiddleware, adminController.systemCron);
 router.get('/tasks/running', adminMiddleware, adminController.runningTasks);
 router.post('/tasks/stop/:name', adminMiddleware, adminController.stopTaskHandler);
 router.post('/clear-cache', adminMiddleware, adminController.clearTmdbCache);
-router.get('/logs/stream', adminMiddleware, adminController.logStream);
+router.get('/logs/stream', adminSseMiddleware, adminController.logStream);
 router.get('/collection', adminMiddleware, adminController.collection);
 router.get('/collection/links', adminMiddleware, adminController.getConvertedLinks);
 router.get('/scraper-state', adminMiddleware, adminController.scraperState);

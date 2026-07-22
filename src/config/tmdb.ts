@@ -1,11 +1,24 @@
 import axios from 'axios';
 import dns from 'dns';
+import dotenv from 'dotenv';
+import path from 'path';
+
+// Ce module est importé avant le dotenv.config() de app.ts : on charge donc
+// le .env ici pour que TMDB_TOKEN soit disponible dès l'initialisation.
+dotenv.config({ path: path.join(__dirname, '../../.env') });
+
+// Le token TMDB (v4 read) doit venir de l'environnement (TMDB_TOKEN).
+// La valeur historique reste en repli pour ne pas casser les déploiements
+// existants, mais elle DOIT être rotée côté TMDB et retirée du code.
+const TMDB_TOKEN =
+  process.env.TMDB_TOKEN ||
+  'eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI1ODY4ZjBmM2NmZTg1MTZmYmQ1NmE2YjNiNzJmOGYwZiIsIm5iZiI6MTc4Mzk0MDMzNi42ODMsInN1YiI6IjZhNTRjNGYwY2M4ZTIzNDZhNWI1MmUxYiIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.33Zn39ASeHdHwv7jxe5-qaPhi-5uSvGqfAOPCSW8ddM';
 
 const tmdbClient = axios.create({
   baseURL: 'https://api.themoviedb.org/3',
   timeout: 10000,
   headers: {
-    Authorization: 'Bearer eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiI1ODY4ZjBmM2NmZTg1MTZmYmQ1NmE2YjNiNzJmOGYwZiIsIm5iZiI6MTc4Mzk0MDMzNi42ODMsInN1YiI6IjZhNTRjNGYwY2M4ZTIzNDZhNWI1MmUxYiIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.33Zn39ASeHdHwv7jxe5-qaPhi-5uSvGqfAOPCSW8ddM',
+    Authorization: `Bearer ${TMDB_TOKEN}`,
     'Content-Type': 'application/json',
   },
   // @ts-ignore

@@ -5,7 +5,6 @@ import { StreamingProvider, StreamQuery } from './providers/provider.interface';
 import { MongoDBProvider } from './providers/mongodb.provider';
 import { DoodStreamProvider } from './providers/doodstream.provider';
 import { VidAPIProvider } from './providers/vidapi.provider';
-import { AnimeKaiProvider } from './providers/animekai.provider';
 import { OtakuProvider } from './providers/otaku.provider';
 import { VidLinkProvider } from './providers/vidlink.provider';
 import { CachedStream, streamCache, getCacheKey } from '../utils/stream-cache';
@@ -176,10 +175,13 @@ export class ProviderManager {
         : provider.getEpisodeStream(query));
 
       if (!result || !result.embedUrl) {
-        this.recordFailure(provider.name);
+        // "Pas de résultat" = contenu absent de ce provider (cas NORMAL),
+        // ce n'est PAS une panne : on ne déclenche pas le circuit breaker,
+        // sinon les recherches de contenus non stockés le feraient sauter
+        // et pénaliseraient les contenus réellement disponibles.
         return {
           provider: provider.name,
-          status: 'fail',
+          status: 'skip',
           reason: 'no result returned',
         };
       }

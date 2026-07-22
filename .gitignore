@@ -5,3 +5,10 @@ dist/
 *.png
 *.html
 debug_*
+
+# Sauvegardes de scraping et artefacts runtime/tests (ne pas versionner)
+*.bak-*
+src/scraping/core/*.bak-*
+.runtime/
+test-results/
+playwright-report/

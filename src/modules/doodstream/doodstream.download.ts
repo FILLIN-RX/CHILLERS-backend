@@ -45,6 +45,17 @@ function parseSeasonEpisode(filename: string): { season: number; episode: number
   return null;
 }
 
+/**
+ * Extrait le fileCode DoodStream d'une URL embed/download (/e/ ou /d/).
+ * Permet de retomber sur une page /d/ téléchargeable quand seule une URL
+ * embed est stockée en base (sans champ fileCode explicite).
+ */
+function extractDoodFileCode(url: string | undefined | null): string | null {
+  if (!url) return null;
+  const m = url.match(/(?:doodstream\.com|playmogo\.com|d000d\.com|d0000d\.com|dood\.(?:to|sh|so|cx|la|wf|pm))\/(?:d|e)\/([a-zA-Z0-9]+)/i);
+  return m ? m[1] : null;
+}
+
 let cachedUploadedFiles: Record<string, any> | null = null;
 let lastCacheTime = 0;
 const CACHE_TTL = 30 * 1000; // 30 seconds
@@ -202,6 +213,7 @@ async function findByMongoDB(title?: string, tmdbId?: number, season?: number, e
               : null;
           if (jsonMatch?.fileCode) fileCode = jsonMatch.fileCode;
         }
+        if (!fileCode) fileCode = extractDoodFileCode(movie.lien) || extractDoodFileCode(movie.uqloadLink) || '';
         if (lien || fileCode) {
           return {
             fileCode,
@@ -221,8 +233,12 @@ async function findByMongoDB(title?: string, tmdbId?: number, season?: number, e
 
       if (series) {
         const epLabel = `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
+        // Matching aligné sur le streaming : d'abord les champs numériques
+        // season/episodeNumber, puis le label string `episode` en fallback.
         const found = series.episodes.find(
-          (ep: any) => ep.episode?.toUpperCase() === epLabel
+          (ep: any) =>
+            (Number(ep.season) === Number(season) && Number(ep.episodeNumber) === Number(episode)) ||
+            ep.episode?.toUpperCase() === epLabel
         );
         if (found) {
           const lien = found.uqloadLink || found.lien;
@@ -235,6 +251,7 @@ async function findByMongoDB(title?: string, tmdbId?: number, season?: number, e
                 : null;
             if (jsonMatch?.fileCode) fileCode = jsonMatch.fileCode;
           }
+          if (!fileCode) fileCode = extractDoodFileCode(found.lien) || extractDoodFileCode(found.uqloadLink) || '';
           if (lien || fileCode) {
             return {
               fileCode,
