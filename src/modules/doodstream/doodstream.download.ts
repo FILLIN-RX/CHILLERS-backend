@@ -193,9 +193,18 @@ async function findByMongoDB(title?: string, tmdbId?: number, season?: number, e
       }).exec();
       if (movie) {
         const lien = movie.uqloadLink || movie.lien;
-        if (lien) {
+        let fileCode = movie.fileCode || '';
+        if (!fileCode) {
+          const jsonMatch = title
+            ? findByTitle(title, season, episode)
+            : tmdbId
+              ? findByTmdbId(tmdbId, season, episode)
+              : null;
+          if (jsonMatch?.fileCode) fileCode = jsonMatch.fileCode;
+        }
+        if (lien || fileCode) {
           return {
-            fileCode: movie.fileCode || '',
+            fileCode,
             info: { lien, titre: movie.titre, uqloadLink: movie.uqloadLink, lienFallback: movie.lien !== lien ? movie.lien : undefined },
           };
         }
@@ -217,9 +226,18 @@ async function findByMongoDB(title?: string, tmdbId?: number, season?: number, e
         );
         if (found) {
           const lien = found.uqloadLink || found.lien;
-          if (lien) {
+          let fileCode = found.fileCode || '';
+          if (!fileCode) {
+            const jsonMatch = title
+              ? findByTitle(title, season, episode)
+              : tmdbId
+                ? findByTmdbId(tmdbId, season, episode)
+                : null;
+            if (jsonMatch?.fileCode) fileCode = jsonMatch.fileCode;
+          }
+          if (lien || fileCode) {
             return {
-              fileCode: found.fileCode || '',
+              fileCode,
               info: { lien, titre: `${series.titre} ${epLabel}`, uqloadLink: found.uqloadLink, lienFallback: found.lien !== lien ? found.lien : undefined },
             };
           }
@@ -352,6 +370,11 @@ export const proxyDownload = async (req: Request, res: Response, next: NextFunct
 
     if (!url) {
       return res.status(400).json({ success: false, message: 'Missing ?url= param' });
+    }
+
+    // DoodStream /d/ page → redirect plutôt que proxy (c'est une page HTML)
+    if (/doodstream\.com\/d\//i.test(url)) {
+      return res.redirect(302, url);
     }
 
     const downloadName = filename || 'video.mp4';
