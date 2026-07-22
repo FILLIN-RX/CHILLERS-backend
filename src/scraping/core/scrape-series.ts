@@ -64,9 +64,12 @@ async function saveState(lastPage: number) {
 }
 
 async function scrapeSeriesDetails() {
+    console.log('[START] scrapeSeriesDetails() called — connecting to MongoDB...');
     await connectDB();
+    console.log('[OK] MongoDB connected, launching Playwright...');
 
     const browser = await chromium.launch(browserConfig);
+    console.log('[OK] Playwright browser launched');
     const page = await browser.newPage();
     const apiKey = process.env.UQLOAD_API_KEY;
     const uqload = apiKey ? new UqloadClient(apiKey) : null;
@@ -214,4 +217,8 @@ async function scrapeSeriesDetails() {
     console.log("Scraping terminé.");
 }
 
-scrapeSeriesDetails().catch(console.error);
+scrapeSeriesDetails().catch((err) => {
+    console.log('[FATAL] scrapeSeriesDetails() crashed:', err?.message || err);
+    console.error(err);
+    process.exit(1);
+});

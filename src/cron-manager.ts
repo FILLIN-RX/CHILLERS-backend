@@ -71,8 +71,7 @@ function isPidAlive(pid: number): boolean {
 }
 
 function resolveScript(relativePath: string): string {
-    const fullPath = path.join(__dirname, relativePath);
-    if (!isDev) return fullPath;
+    let fullPath = path.join(__dirname, relativePath);
     const tsPath = fullPath.replace(/\.js$/, '.ts');
     if (fs.existsSync(tsPath)) return tsPath;
     return fullPath;
