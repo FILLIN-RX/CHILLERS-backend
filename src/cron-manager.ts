@@ -74,7 +74,7 @@ function runNodeScript(name: string, scriptRelativePath: string) {
     runProcess(name, 'node', [resolveScript(scriptRelativePath)]);
 }
 
-export const runner = isDev ? runScript : runNodeScript;
+export const runner = runScript;
 
 export function runScrapingTasks() {
     if (process.env.SCRAPER_API_URL) {

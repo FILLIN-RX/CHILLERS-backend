@@ -1,7 +1,5 @@
 import express from 'express';
-import cors from 'cors';
 import helmet from 'helmet';
-import morgan from 'morgan';
 import dotenv from 'dotenv';
 import { errorMiddleware } from './middleware/error.middleware';
 import { clearCache } from './config/tmdb';
@@ -32,23 +30,6 @@ app.use(helmet({
     },
   },
 }));
-const allowedOrigins = (process.env.CORS_ORIGIN || 'https://chillers-pi.vercel.app').split(',').map(s => s.trim());
-
-app.use(cors({
-  origin: (origin, callback) => {
-    if (!origin || allowedOrigins.includes('*')) {
-      callback(null, true);
-      return;
-    }
-    if (allowedOrigins.some(o => origin.startsWith(o))) {
-      callback(null, true);
-      return;
-    }
-    callback(null, true);
-  },
-  credentials: true,
-}));
-app.use(morgan('dev'));
 app.use(express.json());
 
 app.get('/api/health', (_req, res) => {
