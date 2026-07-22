@@ -1,0 +1,1 @@
+* * * * * /home/ruxel/CHILLERS/backend/cron-link-all.sh

@@ -19,6 +19,10 @@ router.post('/maintenance/run', adminMiddleware, adminController.runMaintenance)
 router.post('/cron/start', adminMiddleware, adminController.cronStart);
 router.post('/cron/stop', adminMiddleware, adminController.cronStop);
 router.get('/cron/status', adminMiddleware, adminController.cronStatus);
+router.post('/cron/run/:taskId', adminMiddleware, adminController.runTask);
+router.get('/cron/processes', adminMiddleware, adminController.listProcesses);
+router.post('/cron/kill/:pid', adminMiddleware, adminController.killProcess);
+router.get('/cron/system', adminMiddleware, adminController.systemCron);
 router.get('/tasks/running', adminMiddleware, adminController.runningTasks);
 router.post('/tasks/stop/:name', adminMiddleware, adminController.stopTaskHandler);
 router.post('/clear-cache', adminMiddleware, adminController.clearTmdbCache);
