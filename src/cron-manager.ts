@@ -24,7 +24,7 @@ function runProcess(name: string, command: string, args: string[]) {
     console.log(`[${startTime}] ${header}`);
     appendLog(header);
 
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     runningProcesses.set(name, child);
 
     child.stdout.on('data', (data) => {
@@ -58,7 +58,8 @@ export function stopTask(name: string): boolean {
     const child = runningProcesses.get(name);
     if (!child) return false;
     appendLog(`[Admin] Arrêt demandé : ${name}`);
-    child.kill('SIGTERM');
+    try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+    runningProcesses.delete(name);
     return true;
 }
 
@@ -116,6 +117,10 @@ export function stopCron() {
     cronTasks.forEach(t => t.stop());
     cronTasks = [];
     isRunning = false;
+    for (const [name, child] of runningProcesses) {
+        try { process.kill(-child.pid, 'SIGKILL'); } catch {}
+        runningProcesses.delete(name);
+    }
     appendLog('[Cron] Tâches planifiées arrêtées');
     console.log('[Cron] Tâches planifiées arrêtées.');
 }
