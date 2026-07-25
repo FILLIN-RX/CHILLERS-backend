@@ -46,4 +46,8 @@ router.get('/uqload/status', adminMiddleware, adminController.uqloadStatus);
 router.get('/uqload/pending', adminMiddleware, adminController.uqloadPending);
 router.get('/uqload/pending-both', adminMiddleware, adminController.uqloadPendingBoth);
 
+// Scrapper distant proxy routes
+router.get('/scrapper/{*path}', adminMiddleware, adminController.scrapperProxyGet);
+router.post('/scrapper/{*path}', adminMiddleware, adminController.scrapperProxyPost);
+
 export default router;

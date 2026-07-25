@@ -79,10 +79,11 @@ export async function isUqloadFull(): Promise<boolean> {
     const { UqloadClient } = await import('../uqload/uqload.client');
     const client = new UqloadClient(apiKey);
     const res = await client.getAccountInfo();
-    const used = parseInt((res.result as any).storage_used, 10);
+    const usedBytes = parseInt((res.result as any).storage_used, 10);
     const left = (res.result as any).storage_left;
-    console.log(`[Uqload] Storage: ${used}GB used, ${left}GB left`);
-    return used >= 3000 || left <= 0;
+    const usedGB = usedBytes / (1024 * 1024 * 1024);
+    console.log(`[Uqload] Storage: ${usedBytes} bytes (${usedGB.toFixed(2)}GB) used, ${left}GB left`);
+    return usedGB >= 3000 || left <= 0;
   } catch (e: any) {
     console.log(`[Uqload] Storage check failed: ${e.message}`);
     return false;

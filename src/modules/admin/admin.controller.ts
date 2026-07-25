@@ -881,3 +881,59 @@ export async function uqloadPendingBoth(_req: AuthRequest, res: Response) {
         res.status(500).json({ success: false, data: null, message: e.message });
     }
 }
+
+function resolveScrapperPath(req: AuthRequest): string {
+    const p = req.params.path;
+    if (Array.isArray(p)) return '/' + p.join('/');
+    if (p) return '/' + p;
+    return '';
+}
+
+export async function scrapperProxyGet(req: AuthRequest, res: Response) {
+    if (!SCRAPER_API_URL) {
+        res.status(502).json({ success: false, data: null, message: 'SCRAPER_API_URL non configuré' });
+        return;
+    }
+    const endpoint = resolveScrapperPath(req);
+    try {
+        const token = req.headers.authorization?.startsWith('Bearer ')
+            ? req.headers.authorization.split(' ')[1]
+            : req.query.token;
+        const response = await axios({
+            method: 'get',
+            url: `${SCRAPER_API_URL}/api${endpoint}`,
+            params: { ...req.query, token },
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 10000,
+        });
+        res.json(response.data);
+    } catch (e: any) {
+        console.error(`[ScraperProxy] GET ${endpoint}: ${e.message}`);
+        res.status(502).json({ success: false, data: null, message: `Scraper injoignable: ${e.message}` });
+    }
+}
+
+export async function scrapperProxyPost(req: AuthRequest, res: Response) {
+    if (!SCRAPER_API_URL) {
+        res.status(502).json({ success: false, data: null, message: 'SCRAPER_API_URL non configuré' });
+        return;
+    }
+    const endpoint = resolveScrapperPath(req);
+    try {
+        const token = req.headers.authorization?.startsWith('Bearer ')
+            ? req.headers.authorization.split(' ')[1]
+            : req.query.token;
+        const response = await axios({
+            method: 'post',
+            url: `${SCRAPER_API_URL}/api${endpoint}`,
+            data: req.body,
+            params: { token },
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 10000,
+        });
+        res.json(response.data);
+    } catch (e: any) {
+        console.error(`[ScraperProxy] POST ${endpoint}: ${e.message}`);
+        res.status(502).json({ success: false, data: null, message: `Scraper injoignable: ${e.message}` });
+    }
+}
