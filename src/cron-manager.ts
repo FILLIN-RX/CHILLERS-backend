@@ -375,3 +375,81 @@ export async function stopCron() {
 export function getCronStatus() {
     return { running: isRunning, tasks: cronTasks.length };
 }
+
+// ── Tâches de déploiement (exécutées une fois par déploiement) ──────────────
+const DEPLOY_LOCK = path.join(RUNTIME_DIR, 'deploy-uqload.done');
+
+/** Résout un script (dist .js en prod, src .ts en dev) sous dist|src/scripts/. */
+function resolveDeployScript(base: string): { cmd: string; args: string[] } | null {
+    const tsPath = path.join(__dirname, 'scripts', `${base}.ts`);
+    const jsPath = path.join(__dirname, 'scripts', `${base}.js`);
+    if (fs.existsSync(tsPath)) return { cmd: 'npx', args: ['tsx', tsPath] };
+    if (fs.existsSync(jsPath)) return { cmd: 'node', args: [jsPath] };
+    return null;
+}
+
+/** Spawn synchrone-attendable d'un script one-shot ; log stdout/stderr. */
+function spawnOnce(name: string, cmd: string, args: string[]): Promise<number> {
+    return new Promise((resolve) => {
+        const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+        child.stdout?.on('data', (data) => {
+            for (const line of data.toString().split('\n').filter((l: string) => l)) {
+                const msg = `[${name}] ${line}`;
+                console.log(msg);
+                appendLog(msg);
+            }
+        });
+        child.stderr?.on('data', (data) => {
+            for (const line of data.toString().split('\n').filter((l: string) => l)) {
+                const msg = `[${name}] ${line}`;
+                console.error(msg);
+                appendLog(msg);
+            }
+        });
+        child.on('close', (code) => resolve(code ?? -1));
+        child.on('error', (err) => {
+            appendLog(`[${name}] erreur de lancement : ${err.message}`);
+            resolve(-1);
+        });
+    });
+}
+
+/**
+ * Migration DoodStream → Uqload lancée UNE fois par déploiement, en arrière-plan
+ * (ne bloque pas le démarrage du serveur) :
+ *   1. migrate-dood-to-uqload  (upload distant → remplit uqloadCode)
+ *   2. upload-uqload --verify  (résout les liens directs quand le fichier est prêt)
+ *
+ * - Désactivable via RUN_UQLOAD_MIGRATION_ON_DEPLOY=false.
+ * - Ignorée si UQLOAD_API_KEY absente.
+ * - Un fichier verrou dans .runtime/ garantit "une fois par déploiement"
+ *   (le disque Render est recréé à chaque déploiement, mais un simple restart
+ *   du process ne relance donc pas la migration).
+ */
+export async function runDeployTasksOnce(): Promise<void> {
+    if (process.env.RUN_UQLOAD_MIGRATION_ON_DEPLOY === 'false') {
+        console.log('[Deploy] Migration Uqload désactivée (RUN_UQLOAD_MIGRATION_ON_DEPLOY=false).');
+        return;
+    }
+    if (!process.env.UQLOAD_API_KEY) {
+        console.log('[Deploy] UQLOAD_API_KEY absente → migration Uqload ignorée.');
+        return;
+    }
+    if (fs.existsSync(DEPLOY_LOCK)) {
+        console.log('[Deploy] Migration Uqload déjà exécutée pour ce déploiement.');
+        return;
+    }
+    try { fs.writeFileSync(DEPLOY_LOCK, new Date().toISOString(), 'utf8'); } catch { /* best effort */ }
+
+    const migrate = resolveDeployScript('migrate-dood-to-uqload');
+    const upload = resolveDeployScript('upload-uqload');
+    if (!migrate || !upload) {
+        appendLog('[Deploy] Scripts Uqload introuvables → migration ignorée.');
+        return;
+    }
+
+    appendLog('[Deploy] Migration DoodStream → Uqload (une fois)…');
+    await spawnOnce('deploy-migrate-uqload', migrate.cmd, migrate.args);
+    await spawnOnce('deploy-verify-uqload', upload.cmd, [...upload.args, '--verify']);
+    appendLog('[Deploy] Migration Uqload terminée.');
+}

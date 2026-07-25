@@ -263,7 +263,7 @@ export class DoodStreamProvider implements StreamingProvider {
             return { fileCode: '', info: { lien: movie.lien, titre: movie.titre } };
           }
           // Video non hébergée sur Doodstream → ignorer, le maillon suivant
-          // (VidLink/VidAPI) pourra fournir une source alternative
+          // (Otaku) pourra fournir une source alternative
         }
       }
 

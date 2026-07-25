@@ -4,12 +4,9 @@ import path from 'path';
 import { StreamingProvider, StreamQuery } from './providers/provider.interface';
 import { MongoDBProvider } from './providers/mongodb.provider';
 import { DoodStreamProvider } from './providers/doodstream.provider';
-import { VidAPIProvider } from './providers/vidapi.provider';
+import { DirectProvider } from './providers/direct.provider';
 import { OtakuProvider } from './providers/otaku.provider';
-import { VidLinkProvider } from './providers/vidlink.provider';
 import { CachedStream, streamCache, getCacheKey } from '../utils/stream-cache';
-import Movie from '../models/Movie';
-import Serie from '../models/Serie';
 
 const VALIDATION_TIMEOUT = 5000;
 const PROVIDER_TIMEOUT = 10000;
@@ -41,11 +38,10 @@ export class ProviderManager {
 
   private buildProviders(): StreamingProvider[] {
     return [
+      new DirectProvider(),
       new MongoDBProvider(),
       new DoodStreamProvider(),
       new OtakuProvider(),
-      new VidLinkProvider(),
-      new VidAPIProvider(),
     ];
   }
 
@@ -236,46 +232,8 @@ export class ProviderManager {
     return [...supports, ...fallback];
   }
 
-  private async contentExistsInMongoDB(query: StreamQuery): Promise<boolean> {
-    try {
-      const isSerie = query.season !== undefined && query.episode !== undefined;
-      const Model: any = isSerie ? Serie : Movie;
-
-      const orClause: any[] = [];
-      if (query.tmdbId) {
-        orClause.push({ tmdbId: query.tmdbId });
-        orClause.push({ tmdbId: String(query.tmdbId) });
-      }
-      if (query.title) {
-        const safe = query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-        orClause.push({ titre: { $regex: new RegExp(safe, 'i') } });
-        // Match sans espaces/ponctuation pour tolérer les différences de format
-        const stripped = query.title.replace(/[^a-z0-9]/gi, '');
-        if (stripped.length >= 3 && stripped !== safe) {
-          const fuzzy = [...stripped].join('[^a-z0-9]*');
-          orClause.push({ titre: { $regex: new RegExp(fuzzy, 'i') } });
-        }
-      }
-      if (orClause.length === 0) return false;
-
-      const doc = await Model.findOne({ $or: orClause }).exec();
-      if (doc) {
-        console.log(`[ProviderManager] ${isSerie ? 'Série' : 'Film'} trouvé en BD (tmdbId=${query.tmdbId}, titre="${query.title}")`);
-      } else {
-        console.log(`[ProviderManager] ${isSerie ? 'Série' : 'Film'} NON trouvé en BD (tmdbId=${query.tmdbId}, titre="${query.title}") → VidLink/VidAPI gardés`);
-      }
-      return !!doc;
-    } catch (err) {
-      console.error('[ProviderManager] Erreur contentExistsInMongoDB:', err);
-      return false;
-    }
-  }
-
   private async filterProviders(query: StreamQuery): Promise<StreamingProvider[]> {
-    const skipVid = await this.contentExistsInMongoDB(query);
-    const ordered = this.sortProviders(query);
-    if (!skipVid) return ordered;
-    return ordered.filter(p => p.name !== 'vidlink' && p.name !== 'vidapi');
+    return this.sortProviders(query);
   }
 
   /**
@@ -317,9 +275,11 @@ export class ProviderManager {
       url.includes('uqload') ||
       url.includes('youtube.com') ||
       url.includes('doodstream.com') ||
+      url.includes('streamtape.com') ||
       url.includes('playmogo.com') ||
       url.includes('d000d.com') ||
       url.includes('d0000d.com') ||
+      url.includes('/api/doodstream/stream') ||
       /dood\.(to|sh|so|cx|la|wf|pm)/i.test(url) ||
       url.includes('/e/') ||
       url.includes('embed')

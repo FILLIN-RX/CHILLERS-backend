@@ -13,6 +13,9 @@ export interface IMovie extends Document {
   uqloadHls?: string;
   fileCode?: string;
   uploadedAt?: Date;
+  year?: number;
+  streamtapeCode?: string;
+  streamtapeLink?: string;
 }
 
 const MovieSchema: Schema = new Schema({
@@ -28,6 +31,9 @@ const MovieSchema: Schema = new Schema({
   uqloadHls: { type: String },
   fileCode: { type: String },
   uploadedAt: { type: Date },
+  year: { type: Number },
+  streamtapeCode: { type: String },
+  streamtapeLink: { type: String },
 });
 
 export default mongoose.model<IMovie>('Movie', MovieSchema);

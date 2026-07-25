@@ -13,6 +13,8 @@ export interface IEpisode {
     uploadedAt?: Date;
     uqloadCode?: string;
     uqloadLink?: string;
+    streamtapeCode?: string;
+    streamtapeLink?: string;
 }
 
 export interface ISerie extends Document {
@@ -37,6 +39,8 @@ const EpisodeSchema: Schema = new Schema({
     uploadedAt: { type: Date },
     uqloadCode: { type: String },
     uqloadLink: { type: String },
+    streamtapeCode: { type: String },
+    streamtapeLink: { type: String },
 }, { _id: false });
 
 const SerieSchema: Schema = new Schema({
