@@ -447,48 +447,71 @@ export const proxyDownload = async (req: Request, res: Response, next: NextFunct
 
     const downloadName = filename || 'video.mp4';
 
-    const response = await axios.get(url, {
-      responseType: 'stream',
-      timeout: 300000,
-      maxContentLength: Infinity,
-      maxRedirects: 5,
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-        'Referer': 'https://vidzy.cc/',
-      },
-      // Don't try to decompress — we want raw bytes piped through
-      'decompress': false,
-    });
+    // ── Étape 1 : Tenter le MP4 direct ──────────────────────────────────
+    try {
+      const response = await axios.get(url, {
+        responseType: 'stream',
+        timeout: 300000,
+        maxContentLength: Infinity,
+        maxRedirects: 5,
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          'Referer': 'https://uqload.is/',
+        },
+        'decompress': false,
+        validateStatus: (s) => s < 400,
+      });
 
-    const rawContentType = response.headers['content-type'];
-    const upstreamType = (typeof rawContentType === 'string' ? rawContentType : '').toLowerCase();
-    const isHtml = upstreamType.includes('text/html') || upstreamType.includes('application/xhtml');
+      const rawContentType = response.headers['content-type'];
+      const upstreamType = (typeof rawContentType === 'string' ? rawContentType : '').toLowerCase();
+      const isHtml = upstreamType.includes('text/html') || upstreamType.includes('application/xhtml');
 
-    if (isHtml) {
-      // The upstream returned an HTML page (Doodstream "click to
-      // download" page, an error page, etc.) — refuse to forward it
-      // as a .mp4 download. The user would otherwise get a tiny
-      // unplayable file.
-      console.warn(`[PROXY] Refusing HTML upstream (${upstreamType}) for ${url}`);
-      response.data.destroy();
-      if (!res.headersSent) {
-        return res.status(502).json({
-          success: false,
-          message: 'Upstream returned HTML, not a video file',
-        });
+      if (!isHtml) {
+        const contentLength = response.headers['content-length'] as string | undefined;
+        if (contentLength) res.setHeader('Content-Length', contentLength);
+        res.setHeader('Content-Type', 'video/mp4');
+        res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+        response.data.pipe(res);
+        return;
       }
-      return;
+      response.data.destroy();
+      console.log(`[PROXY] MP4 direct bloqué (HTML), fallback HLS pour ${url}`);
+    } catch {
+      console.log(`[PROXY] MP4 direct 403/erreur, fallback HLS pour ${url}`);
     }
 
-    const contentLength = response.headers['content-length'] as string | undefined;
-    if (contentLength) {
-      res.setHeader('Content-Length', contentLength);
+    // ── Étape 2 : Fallback HLS ──────────────────────────────────────────
+    // Extraire le file_code, cloner, et récupérer le HLS
+    const uqloadMatch = url.match(/uqload\.is\/v\/[^/]+\/[^/]+\/([a-z0-9]+)_/i);
+    const fileCode = uqloadMatch?.[1] || url.match(/([a-z0-9]{12})/i)?.[1];
+    if (!fileCode) {
+      return res.status(502).json({ success: false, message: 'No fallback available' });
     }
 
-    res.setHeader('Content-Type', 'video/mp4');
-    res.setHeader('Content-Disposition', `attachment; filename="${downloadName}"`);
+    const API_KEY = process.env.UQLOAD_API_KEY || '';
+    if (!API_KEY) {
+      return res.status(502).json({ success: false, message: 'No API key for HLS fallback' });
+    }
 
-    response.data.pipe(res);
+    // Cloner pour un nouveau filecode + direct_link HLS
+    const cloneRes = await axios.get(`https://uqload.is/api/file/clone?key=${API_KEY}&file_code=${fileCode}`, { timeout: 10000 });
+    const cloneCode = cloneRes.data?.result?.filecode;
+    if (!cloneCode) {
+      return res.status(502).json({ success: false, message: 'Clone failed for HLS fallback' });
+    }
+
+    const hlsRes = await axios.get(`https://uqload.is/api/file/direct_link?key=${API_KEY}&file_code=${cloneCode}&hls=1`, { timeout: 10000 });
+    const hlsUrl = hlsRes.data?.result?.hls_direct;
+    if (!hlsUrl) {
+      return res.status(502).json({ success: false, message: 'HLS direct_link failed' });
+    }
+
+    // Proxy l'HLS → le pipe au client avec Content-Disposition download
+    const hlsProxyUrl = `/api/doodstream/stream?url=${encodeURIComponent(hlsUrl)}&referer=${encodeURIComponent('https://uqload.is/')}`;
+    console.log(`[PROXY] Fallback HLS download: ${hlsProxyUrl.slice(0, 100)}`);
+
+    // Rediriger vers le proxy stream (qui gère la réécriture des URLs HLS)
+    res.redirect(302, hlsProxyUrl);
   } catch (error: any) {
     console.error('[PROXY] Download error:', error.message);
     if (!res.headersSent) {

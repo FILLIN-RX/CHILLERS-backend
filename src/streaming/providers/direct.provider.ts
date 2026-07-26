@@ -57,7 +57,7 @@ export class DirectProvider implements StreamingProvider {
     // 3. Scrape pour extraire l'URL directe
     console.log(`${TAG} ${label} → lancement du scrape de ${embedUrl.slice(0, 80)}...`);
     const t0 = Date.now();
-    let scraped = await scrapeDirectStream(embedUrl);
+    let scraped = await scrapeDirectStream(embedUrl, true);
     let elapsed = Date.now() - t0;
 
     // 3b. Si le scrape Doodstream échoue (Cloudflare 403), tente l'embed Uqload
@@ -67,7 +67,7 @@ export class DirectProvider implements StreamingProvider {
         const uqloadEmbedUrl = `https://uqload.is/embed-${uqloadCode}.html`;
         console.log(`${TAG} ${label} → Doodstream échoué, tentative Uqload (${uqloadEmbedUrl})...`);
         const t1 = Date.now();
-        scraped = await scrapeDirectStream(uqloadEmbedUrl);
+        scraped = await scrapeDirectStream(uqloadEmbedUrl, true);
         elapsed = Date.now() - t1;
       }
     }

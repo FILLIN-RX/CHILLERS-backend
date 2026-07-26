@@ -187,7 +187,7 @@ async function scrapeDoodstreamEmbed(embedUrl: string): Promise<DirectStreamResu
 
 // ─── Uqload Scraper ───────────────────────────────────────────────────────────
 
-async function scrapeUqloadEmbed(embedUrl: string): Promise<DirectStreamResult | null> {
+async function scrapeUqloadEmbed(embedUrl: string, preferHls = false): Promise<DirectStreamResult | null> {
   const code = extractUqloadCode(embedUrl);
   if (!code) {
     console.log(`${TAG} Uqload: impossible d'extraire le fileCode de "${embedUrl}"`);
@@ -196,7 +196,7 @@ async function scrapeUqloadEmbed(embedUrl: string): Promise<DirectStreamResult |
 
   // Strategy 0: Uqload API (fresh direct link, no scraping needed)
   console.log(`${TAG} Uqload: S0 — tentative API direct_link pour code=${code}...`);
-  const apiResult = await getUqloadDirectLink(code);
+  const apiResult = await getUqloadDirectLink(code, preferHls);
   if (apiResult) {
     console.log(`${TAG} Uqload: S0 ✅ lien frais via API → ${apiResult.directUrl.slice(0, 120)}`);
     return apiResult;
@@ -312,15 +312,36 @@ interface UqloadDirectLinkResult {
   file_length?: string;
 }
 
-async function getUqloadDirectLink(fileCode: string): Promise<DirectStreamResult | null> {
+/** Clone un fichier Uqload pour obtenir un nouveau filecode (CDN bypass) */
+async function cloneFileCode(fileCode: string): Promise<string> {
+  try {
+    const url = `https://uqload.is/api/file/clone?key=${UQLOAD_API_KEY}&file_code=${fileCode}`;
+    console.log(`${TAG} Uqload clone: file_code=${fileCode}...`);
+    const { data } = await axios.get(url, { timeout: 10000 });
+    if (data.status === 200 && data.result?.filecode) {
+      console.log(`${TAG} Uqload clone: ✅ nouveau filecode=${data.result.filecode}`);
+      return data.result.filecode;
+    }
+    console.log(`${TAG} Uqload clone: ⚠ échec, utilisation du code original`);
+    return fileCode;
+  } catch (err: any) {
+    console.log(`${TAG} Uqload clone: ERREUR ${err.message}, utilisation du code original`);
+    return fileCode;
+  }
+}
+
+async function getUqloadDirectLink(fileCode: string, preferHls = false): Promise<DirectStreamResult | null> {
   if (!UQLOAD_API_KEY) {
     console.log(`${TAG} Uqload API: pas de clé API configurée`);
     return null;
   }
 
+  // Pour le download : cloner d'abord pour obtenir un nouveau filecode (CDN bypass)
+  const targetCode = preferHls ? fileCode : await cloneFileCode(fileCode);
+
   try {
-    const apiUrl = `https://uqload.is/api/file/direct_link?key=${UQLOAD_API_KEY}&file_code=${fileCode}`;
-    console.log(`${TAG} Uqload API: GET ${apiUrl}`);
+    const apiUrl = `https://uqload.is/api/file/direct_link?key=${UQLOAD_API_KEY}&file_code=${targetCode}${preferHls ? '&hls=1' : ''}`;
+    console.log(`${TAG} Uqload API: GET ${apiUrl}${preferHls ? ' (HLS mode)' : ' (MP4 mode)'}`);
     const { data } = await axios.get(apiUrl, { timeout: 10000 });
     console.log(`${TAG} Uqload API: status=${data.status}, msg=${data.msg}`);
 
@@ -331,8 +352,8 @@ async function getUqloadDirectLink(fileCode: string): Promise<DirectStreamResult
 
     const result = data.result as UqloadDirectLinkResult;
 
-    // Prefer HLS direct URL (master.m3u8) — always works
-    if (result.hls_direct) {
+    // Préférer HLS pour le streaming, MP4 pour le download
+    if (preferHls && result.hls_direct) {
       console.log(`${TAG} Uqload API: ✅ HLS direct → ${result.hls_direct.slice(0, 120)}`);
       return {
         directUrl: result.hls_direct,
@@ -341,73 +362,41 @@ async function getUqloadDirectLink(fileCode: string): Promise<DirectStreamResult
       };
     }
 
-    // Only .mp4 versions available — verify if actually accessible
+    // Fallback to highest quality .mp4 (ou seul .mp4 si download)
     const versions = result.versions || [];
     const qualityOrder: Record<string, number> = { n: 4, h: 3, l: 2, o: 1 };
     const sorted = [...versions].sort((a, b) => (qualityOrder[a.name] || 0) - (qualityOrder[b.name] || 0));
     if (sorted.length > 0) {
       const best = sorted[0];
-      // Quick HEAD check to see if the URL is actually accessible
-      try {
-        const headRes = await axios.head(best.url, {
-          timeout: 5000,
-          headers: { 'User-Agent': UA, Referer: 'https://uqload.is/' },
-        });
-        if (headRes.status >= 400) throw new Error(`HTTP ${headRes.status}`);
-        console.log(`${TAG} Uqload API: ✅ MP4 direct (${best.name}) → ${best.url.slice(0, 120)}`);
-        return {
-          directUrl: best.url,
-          type: 'mp4',
-          referer: 'https://uqload.is/',
-        };
-      } catch {
-        console.log(`${TAG} Uqload API: ⚠️ MP4 direct (${best.name}) inaccessible (403/blocked), fallback scraping`);
-      }
+      console.log(`${TAG} Uqload API: ✅ MP4 direct (${best.name}) → ${best.url.slice(0, 120)}`);
+      return {
+        directUrl: best.url,
+        type: 'mp4',
+        referer: 'https://uqload.is/',
+      };
     }
 
-    // Fallback: scrape embed page for HLS
-    console.log(`${TAG} Uqload API: fallback scraping pour HLS (code=${fileCode})`);
-    const fallback = await scrapeUqloadFallback(fileCode);
-    if (fallback) console.log(`${TAG} Uqload API: ✅ HLS via scraping → ${fallback.directUrl.slice(0, 120)}`);
-    return fallback;
+    // HLS uniquement si pas de MP4 mais HLS disponible (download path)
+    if (!preferHls && result.hls_direct) {
+      console.log(`${TAG} Uqload API: ✅ HLS direct (fallback, pas de MP4) → ${result.hls_direct.slice(0, 120)}`);
+      return {
+        directUrl: result.hls_direct,
+        type: 'hls',
+        referer: 'https://uqload.is/',
+      };
+    }
+
+    console.log(`${TAG} Uqload API: ❌ aucune version disponible`);
+    return null;
   } catch (err: any) {
     console.log(`${TAG} Uqload API: ERREUR ${err.message}`);
     return null;
   }
 }
 
-/** Scrape l'embed Uqload pour extraire le HLS (fallback quand l'API ne donne que du .mp4 bloqué) */
-async function scrapeUqloadFallback(fileCode: string): Promise<DirectStreamResult | null> {
-  try {
-    const { data: html } = await axios.get(`https://uqload.is/embed-${fileCode}.html`, {
-      timeout: 15000,
-      headers: { 'User-Agent': UA, Referer: 'https://uqload.is/' },
-    });
-    const decoded = decodePacker(html);
-    if (decoded) {
-      const allMatched = decoded.match(/(?:file|src)\s*[:=]\s*["']?(https?:\/\/[^\s"'<>]+\.(?:mp4|m3u8)[^\s"'<>]*)/gi) || [];
-      for (const match of allMatched) {
-        const urlMatch = match.match(/(https?:\/\/[^\s"'<>]+)/i);
-        if (!urlMatch) continue;
-        const url = urlMatch[1];
-        if (/\.m3u8/i.test(url)) {
-          return {
-            directUrl: url,
-            type: 'hls',
-            referer: 'https://uqload.is/',
-          };
-        }
-      }
-    }
-    return null;
-  } catch {
-    return null;
-  }
-}
-
 // ─── Public API ───────────────────────────────────────────────────────────────
 
-export async function scrapeDirectStream(embedUrl: string): Promise<DirectStreamResult | null> {
+export async function scrapeDirectStream(embedUrl: string, preferHls = false): Promise<DirectStreamResult | null> {
   console.log(`${TAG} scrapeDirectStream("${embedUrl.slice(0, 100)}")`);
 
   if (isDoodstreamUrl(embedUrl)) {
@@ -416,7 +405,7 @@ export async function scrapeDirectStream(embedUrl: string): Promise<DirectStream
   }
   if (isUqloadUrl(embedUrl)) {
     console.log(`${TAG} → détecté comme Uqload`);
-    return scrapeUqloadEmbed(embedUrl);
+    return scrapeUqloadEmbed(embedUrl, preferHls);
   }
   console.log(`${TAG} → URL non scrapable (ni Doodstream ni Uqload)`);
   return null;
