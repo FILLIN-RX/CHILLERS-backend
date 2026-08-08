@@ -263,12 +263,12 @@ async function findByMongoDB(title?: string, tmdbId?: number, season?: number, e
     if (!tmdbId && !title) return null;
 
     if (!season && !episode) {
-      const movie = await Movie.findOne({
-        $or: [
-          ...(tmdbId ? [{ tmdbId }] : []),
-          ...(title ? [{ titre: { $regex: new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }] : []),
-        ],
-      }).exec();
+      // Priority 1: tmdbId exact, Priority 2: title regex
+      let movie = tmdbId ? await Movie.findOne({ tmdbId }).exec() : null;
+      if (!movie && title) {
+        const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        movie = await Movie.findOne({ titre: { $regex: new RegExp(escaped, 'i') } }).exec();
+      }
       if (movie) {
         const lien = movie.uqloadLink || movie.lien;
         let fileCode = movie.fileCode || '';
@@ -291,17 +291,28 @@ async function findByMongoDB(title?: string, tmdbId?: number, season?: number, e
     }
 
     if (season !== undefined && episode !== undefined) {
-      const series = await Serie.findOne({
-        $or: [
-          ...(tmdbId ? [{ tmdbId }] : []),
-          ...(title ? [{ titre: { $regex: new RegExp(title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }] : []),
-        ],
-      }).exec();
+      // Priority 1: tmdbId exact, Priority 2: title regex
+      let series: any = null;
+      if (tmdbId) {
+        const byId = await Serie.find({ tmdbId }).exec();
+        if (byId.length) {
+          series = byId.find((s: any) => s.episodes?.some(
+            (e: any) => Number(e.season) === Number(season)
+          )) || byId[0];
+        }
+      }
+      if (!series && title) {
+        const escaped = title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const byTitle = await Serie.find({ titre: { $regex: new RegExp(escaped, 'i') } }).exec();
+        if (byTitle.length) {
+          series = byTitle.find((s: any) => s.episodes?.some(
+            (e: any) => Number(e.season) === Number(season)
+          )) || byTitle[0];
+        }
+      }
 
       if (series) {
         const epLabel = `S${String(season).padStart(2, '0')}E${String(episode).padStart(2, '0')}`;
-        // Matching aligné sur le streaming : d'abord les champs numériques
-        // season/episodeNumber, puis le label string `episode` en fallback.
         const found = series.episodes.find(
           (ep: any) =>
             (Number(ep.season) === Number(season) && Number(ep.episodeNumber) === Number(episode)) ||
@@ -401,8 +412,11 @@ export const getDownloadByTitle = async (req: Request, res: Response, next: Next
           const Movie = (await import('../../models/Movie')).default;
           const Serie = (await import('../../models/Serie')).default;
           if (seasonNum !== undefined && episodeNum !== undefined) {
-            const s = await Serie.findOne({ tmdbId: Number(tmdb_id) }).exec();
-            if (!s) return null;
+            const byId = await Serie.find({ tmdbId: Number(tmdb_id) }).exec();
+            if (!byId.length) return null;
+            const s = byId.find((doc: any) => doc.episodes?.some(
+              (e: any) => Number(e.season) === Number(seasonNum)
+            )) || byId[0];
             const ep = s.episodes.find((e: any) => Number(e.season) === Number(seasonNum) && Number(e.episodeNumber) === Number(episodeNum));
             return ep?.uqloadCode || null;
           }
@@ -721,14 +735,27 @@ export const getSeriesDownloadCheck = async (req: Request, res: Response, next: 
     // Beaucoup de documents en base n'ont pas de tmdbId (≈36 %) : on matche
     // aussi par titre TMDB, exactement comme findByMongoDB le fait pour le
     // téléchargement simple.
-    const serie = await Serie.findOne({
-      $or: [
-        { tmdbId: tmdbIdNum },
-        ...(seriesData.name
-          ? [{ titre: { $regex: new RegExp(seriesData.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }]
-          : []),
-      ],
-    }).exec();
+    const serie = await (async () => {
+      const byId = await Serie.find({ tmdbId: tmdbIdNum }).exec();
+      if (byId.length) {
+        // Préférer la série dont les épisodes couvrent le plus de saisons
+        // attendues (les doublons tmdbId existent : séries homonymes).
+        let best = byId[0];
+        let bestScore = -1;
+        for (const s of byId) {
+          const score = s.episodes?.filter(
+            (e: any) => expectedEpisodes.some(ep => Number(e.season) === ep.season)
+          ).length || 0;
+          if (score > bestScore) { bestScore = score; best = s; }
+        }
+        return best;
+      }
+      if (seriesData.name) {
+        const escaped = seriesData.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        return Serie.findOne({ titre: { $regex: new RegExp(escaped, 'i') } }).exec();
+      }
+      return null;
+    })();
 
     for (const ep of expectedEpisodes) {
       let match: { fileCode: string; info: any } | null = null;

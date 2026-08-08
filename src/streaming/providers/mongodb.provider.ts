@@ -65,13 +65,13 @@ export class MongoDBProvider implements StreamingProvider {
 
   async getMovieStream(query: StreamQuery): Promise<StreamResult | null> {
     try {
-      const movie = await Movie.findOne({
-        $or: [
-          ...(query.tmdbId ? [{ tmdbId: query.tmdbId }] : []),
-          ...(query.title ? [{ titre: { $regex: new RegExp(query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }] : []),
-        ],
-      }).exec();
-
+      // Priority 1: exact tmdbId match
+      let movie = query.tmdbId ? await Movie.findOne({ tmdbId: query.tmdbId }).exec() : null;
+      // Priority 2: title regex fallback
+      if (!movie && query.title) {
+        const escaped = query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        movie = await Movie.findOne({ titre: { $regex: new RegExp(escaped, 'i') } }).exec();
+      }
       if (!movie) return null;
 
       // Priorité au streaming Uqload via son lecteur iframe (embed-<code>.html)
@@ -103,12 +103,19 @@ export class MongoDBProvider implements StreamingProvider {
     if (query.season === undefined || query.episode === undefined) return null;
 
     try {
-      const serie = await Serie.findOne({
-        $or: [
-          ...(query.tmdbId ? [{ tmdbId: query.tmdbId }] : []),
-          ...(query.title ? [{ titre: { $regex: new RegExp(query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }] : []),
-        ],
-      }).exec();
+      // Priority 1: exact tmdbId match
+      let serie = query.tmdbId ? await this.findSerie(query) : null;
+      // Priority 2: title regex fallback
+      if (!serie && query.title) {
+        const escaped = query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+        const byTitle = await Serie.find({ titre: { $regex: new RegExp(escaped, 'i') } }).exec();
+        if (byTitle.length) {
+          const bySeason = byTitle.find(s => s.episodes?.some(
+            (e: any) => Number(e.season) === Number(query.season)
+          ));
+          serie = bySeason || byTitle[0];
+        }
+      }
 
       if (!serie) return null;
 
@@ -116,13 +123,9 @@ export class MongoDBProvider implements StreamingProvider {
         (e: any) => Number(e.season) === Number(query.season) && Number(e.episodeNumber) === Number(query.episode)
       );
 
-      // Fallback: if requested season/episode is missing, use the first available episode in DB
       if (!ep || (!ep.uqloadLink && !ep.lien)) {
-        const fallbackEp = serie.episodes.find((e: any) => (e.uqloadLink && e.uqloadLink !== '#') || (e.lien && e.lien !== '#'));
-        if (fallbackEp) {
-          console.log(`[MongoDB] S${query.season}E${query.episode} indisponible, fallback vers S${fallbackEp.season}E${fallbackEp.episodeNumber} pour "${serie.titre}"`);
-          ep = fallbackEp;
-        }
+        console.log(`[MongoDB] S${query.season}E${query.episode} indisponible pour "${serie.titre}" → skip`);
+        return null;
       }
 
       if (!ep) return null;
@@ -142,6 +145,22 @@ export class MongoDBProvider implements StreamingProvider {
       return null;
     } catch (err) {
       console.error('[MongoDB] getEpisodeStream error:', err);
+    }
+    return null;
+  }
+
+  private async findSerie(query: StreamQuery): Promise<any> {
+    if (query.tmdbId) {
+      const byId = await Serie.find({ tmdbId: query.tmdbId }).exec();
+      if (byId.length) {
+        if (query.season !== undefined) {
+          const bySeason = byId.find(s => s.episodes?.some(
+            (e: any) => Number(e.season) === Number(query.season)
+          ));
+          if (bySeason) return bySeason;
+        }
+        return byId[0];
+      }
     }
     return null;
   }
