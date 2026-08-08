@@ -23,12 +23,17 @@ router.get('/stream', (req: Request, res: Response) => {
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.setHeader('Content-Type', 'video/mp4');
 
+  // -http_multiple 0 : force les requêtes HTTP séquentielles (le CDN Uqload
+  //   rejette les téléchargements parallèles de segments → 403 intermittent).
+  // -movflags frag_keyframe+empty_moov : MP4 fragmenté, le seul muxage MP4
+  //   possible sur un pipe non-seekable (+faststart échoue sur pipe:1).
   const ffmpeg = spawn('ffmpeg', [
     '-y',
+    '-http_multiple', '0',
     '-i', m3u8Url,
     '-c', 'copy',
     '-bsf:a', 'aac_adtstoasc',
-    '-movflags', '+faststart',
+    '-movflags', 'frag_keyframe+empty_moov',
     '-f', 'mp4',
     'pipe:1',
   ]);

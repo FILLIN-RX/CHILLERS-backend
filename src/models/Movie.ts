@@ -16,6 +16,11 @@ export interface IMovie extends Document {
   year?: number;
   streamtapeCode?: string;
   streamtapeLink?: string;
+  posterUrl?: string;
+  posterSource?: string;
+  speech?: string;
+  disponible?: boolean;
+  disponibleCheckedAt?: Date;
 }
 
 const MovieSchema: Schema = new Schema({
@@ -34,6 +39,11 @@ const MovieSchema: Schema = new Schema({
   year: { type: Number },
   streamtapeCode: { type: String },
   streamtapeLink: { type: String },
+  posterUrl: { type: String },
+  posterSource: { type: String, enum: ['tmdb', 'web', 'ai', 'none'], default: undefined },
+  speech: { type: String },
+  disponible: { type: Boolean },
+  disponibleCheckedAt: { type: Date },
 });
 
 export default mongoose.model<IMovie>('Movie', MovieSchema);

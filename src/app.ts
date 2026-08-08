@@ -12,6 +12,8 @@ import downloadRoutes from './modules/download/download.routes';
 import doodstreamRoutes from './modules/doodstream/doodstream.routes';
 import otakuRoutes from './modules/otaku/otaku.routes';
 import adminRoutes from './modules/admin/admin.routes';
+import availabilityRoutes from './modules/availability/availability.routes';
+import affichesRoutes from './modules/affiches/affiches.routes';
 
 import path from 'path';
 dotenv.config({ path: path.join(__dirname, '../.env') });
@@ -22,7 +24,7 @@ app.use(helmet({
   contentSecurityPolicy: {
     directives: {
       defaultSrc: ["'self'"],
-      frameSrc: ["'self'", "https://animekai.to", "https://*.vidlink.pro", "https://vidapi.xyz", "https://www.youtube.com"],
+      frameSrc: ["'self'", "https://animekai.to", "https://*.vidlink.pro", "https://vidapi.xyz", "https://www.youtube.com", "https://doodstream.com", "https://*.doodstream.com", "https://d000d.com", "https://*.d000d.com", "https://d0000d.com", "https://playmogo.com", "https://*.playmogo.com", "https://*.dood.to", "https://*.vidzy.cc", "https://vidsrc.xyz", "https://embed.su", "https://uqload.is", "https://*.uqload.is", "https://www.google.com", "https://*.google.com"],
       scriptSrc: ["'self'", "'unsafe-inline'"],
       styleSrc: ["'self'", "'unsafe-inline'", "https:"],
       imgSrc: ["'self'", "data:", "https:"],
@@ -31,6 +33,10 @@ app.use(helmet({
   },
 }));
 app.use(express.json());
+
+// Fichiers uploadés manuellement par l'admin (uploads/ en mémoire) - servis
+// publiquement pour permettre l'upload Uqload via URL
+app.use('/uploads', express.static(path.join(__dirname, '../uploads')));
 
 app.get('/api/health', (_req, res) => {
   res.json({ success: true, data: { status: 'ok' }, message: null });
@@ -50,6 +56,8 @@ app.use('/api/download', downloadRoutes);
 app.use('/api/doodstream', doodstreamRoutes);
 app.use('/api/otaku', otakuRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/availability', availabilityRoutes);
+app.use('/api/affiches', affichesRoutes);
 
 app.use((_req, res) => {
   res.status(404).json({

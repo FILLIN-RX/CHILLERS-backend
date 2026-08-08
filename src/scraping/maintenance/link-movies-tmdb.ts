@@ -13,7 +13,7 @@ function normalize(str: string): string {
   return str
     .toLowerCase()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[̀-ͯ]/g, '')
     .replace(/[^a-z0-9 ]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -41,6 +41,37 @@ async function searchTmdbMovie(query: string, year?: number | null): Promise<any
   }
 }
 
+/**
+ * Lie un film MongoDB à son ID TMDB. Utilisable depuis un save-site (auto-link)
+ * ou depuis le batch main(). Ne lève jamais — retourne un statut structuré.
+ */
+export async function linkMovieTmdb(movieId: string): Promise<{ ok: boolean; tmdbId?: number; reason?: string }> {
+  try {
+    const movie: any = await Movie.findById(movieId).select('titre tmdbId year').lean();
+    if (!movie) return { ok: false, reason: 'not_found' };
+    if (movie.tmdbId) return { ok: true, tmdbId: movie.tmdbId };
+
+    const results = await searchTmdbMovie(movie.titre, movie.year);
+    if (results.length === 0) return { ok: false, reason: 'no_tmdb_results' };
+
+    for (let i = 0; i < Math.min(3, results.length); i++) {
+      const candidate = results[i];
+      const candidateTitle = candidate.title || candidate.name || '';
+      const sim = nameSimilarity(movie.titre, candidateTitle);
+      if (sim < 0.3) continue;
+      if (sim >= 0.5 || (sim >= 0.3 && i === 0)) {
+        await Movie.updateOne({ _id: movie._id }, { $set: { tmdbId: candidate.id } });
+        console.log(`[TMDB-AUTO] Movie "${movie.titre}" → tmdbId=${candidate.id} (sim=${sim.toFixed(2)})`);
+        return { ok: true, tmdbId: candidate.id };
+      }
+    }
+    return { ok: false, reason: 'no_match' };
+  } catch (err: any) {
+    console.error(`[TMDB-AUTO] Movie ${movieId} failed:`, err.message);
+    return { ok: false, reason: 'exception' };
+  }
+}
+
 async function main() {
   await connectDB();
 
@@ -61,11 +92,13 @@ async function main() {
   const total = toLink.length;
 
   for (let idx = 0; idx < total; idx++) {
-    const movie = toLink[idx];
+    const movie: any = toLink[idx];
     const title = movie.titre;
 
     console.log(`[${idx + 1}/${total}] "${title}"`);
 
+    // Use the reusable linkMovieTmdb (it prints its own [TMDB-AUTO] on success).
+    // Re-run a manual search here so the batch script keeps its rich console output.
     const results = await searchTmdbMovie(title);
     if (results.length === 0) {
       errors.push(`[SEARCH] No TMDB results for "${title}"`);
@@ -117,4 +150,7 @@ async function main() {
   }
 }
 
-main().catch(err => console.error('[FATAL]', err));
+// Exécuter main() uniquement si le script est lancé directement (pas en import).
+if (require.main === module) {
+  main().catch(err => console.error('[FATAL]', err));
+}

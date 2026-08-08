@@ -3,6 +3,143 @@ import { BatchResult } from './uqload.types';
 import Movie from '../../models/Movie';
 import Serie from '../../models/Serie';
 
+export interface SaveAndUploadParams {
+  type: 'movie' | 'series';
+  titre: string;
+  pageUrl: string;
+  url: string;
+  year?: number;
+  season?: number;
+  episodeLabel?: string;
+  episodeNumber?: number;
+}
+
+export interface SaveAndUploadResult {
+  success: boolean;
+  fileCode?: string;
+  directLink?: string;
+  message?: string;
+  dbAction: 'created' | 'updated' | 'duplicate';
+}
+
+export async function saveAndUpload(client: UqloadClient, params: SaveAndUploadParams): Promise<SaveAndUploadResult> {
+  const { type, titre, pageUrl, url, year, season, episodeLabel, episodeNumber } = params;
+  const escaped = titre.replace(/[-\/\\^$*+?.()|[\]{}]/g, '\\$&');
+
+  if (type === 'series') {
+    console.log(`[Uqload] ○ Vérification doublon: ${titre} - ${episodeLabel || ''}`);
+    const existing = await Serie.findOne({
+      titre: new RegExp(`^${escaped}$`, 'i'),
+      episodes: {
+        $elemMatch: {
+          season: season || 1,
+          episodeNumber: episodeNumber || 1,
+          uqloadCode: { $exists: true, $ne: null },
+        },
+      },
+    });
+    if (existing) {
+      console.log(`[Uqload] ✗ Doublon: ${titre} - ${episodeLabel || ''} (déjà uploadé)`);
+      return { success: false, message: 'Doublon: épisode déjà uploadé', dbAction: 'duplicate' };
+    }
+
+    const formattedEp = episodeLabel || `S${String(season || 1).padStart(2, '0')}E${String(episodeNumber || 1).padStart(2, '0')}`;
+    console.log(`[Uqload] ○ Sauvegarde DB: ${titre} — ${formattedEp}`);
+
+    // Update existing episode or push new one
+    const existingEp = await Serie.findOne({
+      titre,
+      episodes: { $elemMatch: { season: season || 1, episodeNumber: episodeNumber || 1 } },
+    });
+    let serie;
+    if (existingEp) {
+      const epIdx = existingEp.episodes.findIndex(e => e.season === (season || 1) && e.episodeNumber === (episodeNumber || 1));
+      const setKey = `episodes.${epIdx}`;
+      serie = await Serie.findOneAndUpdate(
+        { _id: existingEp._id },
+        {
+          $set: {
+            [`${setKey}.episode`]: formattedEp,
+            [`${setKey}.lien`]: url,
+            pageUrl,
+            ...(year ? { year } : {}),
+          },
+        },
+        { returnDocument: 'after' },
+      );
+    } else {
+      serie = await Serie.findOneAndUpdate(
+        { titre },
+        {
+          $push: { episodes: { episode: formattedEp, season: season || 1, episodeNumber: episodeNumber || 1, lien: url } },
+          $set: { pageUrl, ...(year ? { year } : {}) },
+        },
+        { upsert: true, returnDocument: 'after' },
+      );
+    }
+    console.log(`[Uqload] ✓ Sauvegarde DB OK: ${titre} — ${formattedEp}`);
+
+    const epIndex = serie!.episodes.findIndex(e => e.season === (season || 1) && e.episodeNumber === (episodeNumber || 1));
+    if (epIndex === -1) return { success: false, message: 'Épisode sauvegardé mais index introuvable', dbAction: 'updated' };
+
+    try {
+      console.log(`[Uqload] ○ Upload Uqload: ${titre} — ${formattedEp}`);
+      const { fileCode, directLink } = await client.uploadByUrlAndGetLink(url, `${titre} - ${formattedEp}`);
+      const bestQuality = directLink?.versions?.find((v: any) => v.name === 'n') || directLink?.versions?.[0];
+      console.log(`[Uqload] ✓ Upload Uqload OK: ${titre} — ${formattedEp} → ${fileCode}`);
+      console.log(`[Uqload] ○ Update DB uqloadCode: ${formattedEp} → ${fileCode}`);
+      await Serie.updateOne(
+        { _id: serie!._id },
+        { $set: { [`episodes.${epIndex}.uqloadCode`]: fileCode, [`episodes.${epIndex}.uqloadLink`]: bestQuality?.url || null } },
+      );
+      console.log(`[Uqload] ✓ DB mise à jour: ${titre} — ${formattedEp}`);
+      return { success: true, fileCode, directLink: bestQuality?.url, dbAction: 'updated' };
+    } catch (e: any) {
+      console.log(`[Uqload] ✗ Upload échoué: ${titre} — ${formattedEp}: ${e.message}`);
+      return { success: false, message: e.message, dbAction: 'updated' };
+    }
+  }
+
+  console.log(`[Uqload] ○ Vérification doublon film: ${titre}`);
+  const existing = await Movie.findOne({ titre: new RegExp(`^${escaped}$`, 'i'), lien: url });
+  if (existing) {
+    console.log(`[Uqload] ✗ Doublon film: ${titre}`);
+    return { success: false, message: 'Doublon: ce lien existe déjà en BD', dbAction: 'duplicate' };
+  }
+
+  console.log(`[Uqload] ○ Sauvegarde DB film: ${titre}`);
+  const movie = await Movie.findOneAndUpdate(
+    { titre },
+    { $set: { titre, pageUrl, lien: url, ...(year ? { year } : {}) } },
+    { upsert: true, returnDocument: 'after' },
+  );
+  console.log(`[Uqload] ✓ Sauvegarde DB film OK: ${titre}`);
+
+  try {
+    console.log(`[Uqload] ○ Upload Uqload film: ${titre}`);
+    const { fileCode, directLink } = await client.uploadByUrlAndGetLink(url, titre);
+    const bestQuality = directLink?.versions?.find((v: any) => v.name === 'n') || directLink?.versions?.[0];
+    console.log(`[Uqload] ✓ Upload Uqload film OK: ${titre} → ${fileCode}`);
+    console.log(`[Uqload] ○ Update DB uqloadCode film: ${titre} → ${fileCode}`);
+    await Movie.updateOne(
+      { _id: movie._id },
+      {
+        $set: {
+          uqloadCode: fileCode,
+          uqloadLink: bestQuality?.url || null,
+          uqloadQualities: directLink?.versions || [],
+          uqloadHls: directLink?.hls_direct || null,
+        },
+      },
+    );
+    console.log(`[Uqload] ✓ DB film mise à jour: ${titre}`);
+    return { success: true, fileCode, directLink: bestQuality?.url, dbAction: 'created' };
+  } catch (e: any) {
+    console.log(`[Uqload] ✗ Upload film échoué: ${titre}: ${e.message}`);
+    return { success: false, message: e.message, dbAction: 'created' };
+  }
+}
+
 const BATCH_SIZE = 100;
 let isUploading = false;
 let shouldStop = false;

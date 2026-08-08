@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { adminMiddleware, adminSseMiddleware } from './admin.middleware';
 import * as adminController from './admin.controller';
+import { mediaUpload } from './media.upload';
 
 const router = Router();
 
@@ -45,6 +46,10 @@ router.post('/uqload/stop', adminMiddleware, adminController.uqloadStop);
 router.get('/uqload/status', adminMiddleware, adminController.uqloadStatus);
 router.get('/uqload/pending', adminMiddleware, adminController.uqloadPending);
 router.get('/uqload/pending-both', adminMiddleware, adminController.uqloadPendingBoth);
+
+router.get('/media/tmdb-search', adminMiddleware, adminController.tmdbSearch);
+router.post('/media/manual', adminMiddleware, adminController.createManualMedia);
+router.post('/media/manual/upload', adminMiddleware, mediaUpload.array('files', 200), adminController.createManualMediaUpload);
 
 // Scrapper distant proxy routes
 router.get('/scrapper/{*path}', adminMiddleware, adminController.scrapperProxyGet);

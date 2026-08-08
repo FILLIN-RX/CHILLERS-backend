@@ -33,6 +33,9 @@ export class UqloadClient {
     const params: Record<string, any> = { url: videoUrl };
     if (title) params.file_title = title;
     const res = await this.get<{ filecode: string }>('/upload/url', params);
+    if (!res.result) {
+      throw new Error(`Uqload upload failed: ${res.msg} (status=${res.status})`);
+    }
     return res.result.filecode;
   }
 

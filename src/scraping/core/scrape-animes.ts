@@ -4,33 +4,9 @@ import Serie from '../../models/Serie';
 import ScraperState from '../../models/ScraperState';
 import { browserConfig } from '../../config/browser';
 import { connectDB } from '../../config/db';
-import { UqloadClient } from '../../modules/uqload/uqload.client';
-import { reuploadEpisode } from '../../modules/reupload/reupload';
+import { uploadToStreamtape } from '../../modules/streamtape/streamtape.uploader';
 import { autoLink } from '../maintenance/auto-link';
 
-async function uploadEpisodeToUqload(client: UqloadClient | null, label: string, lien: string, serieId: string, episodeIndex: number) {
-  if (!client) return;
-  try {
-    console.log(`    -> Upload Uqload: ${label}`);
-    const { fileCode, directLink } = await client.uploadByUrlAndGetLink(lien, label);
-    const bestQuality = directLink?.versions?.find((v: any) => v.name === 'n') || directLink?.versions?.[0];
-    await Serie.updateOne(
-      { _id: serieId },
-      { $set: { [`episodes.${episodeIndex}.uqloadCode`]: fileCode, [`episodes.${episodeIndex}.uqloadLink`]: bestQuality?.url || null } }
-    );
-    console.log(`    -> ✅ Uqload: ${label} → ${fileCode}`);
-  } catch (e: any) {
-    console.log(`    -> ⏭ Uqload ignoré: ${e.message}`);
-  }
-}
-
-/**
- * Parse the episode label returned by Otaku's #fs-episode-select into a
- * structured (season, episodeNumber, canonicalLabel) tuple. Otaku uses
- * "S01E05" or just "Ép 5" depending on the source page. The schema
- * requires a numeric `season` + `episodeNumber` so the maintainer can
- * match by positional operator.
- */
 function parseEpisodeLabel(label: string, defaultSeason = 1): { season: number; episodeNumber: number; canonical: string } {
     const trimmed = label.trim();
     const sxxExx = trimmed.match(/S(\d+)\s*E\s*(\d+)/i);
@@ -49,7 +25,7 @@ function parseEpisodeLabel(label: string, defaultSeason = 1): { season: number; 
 
 async function loadState(): Promise<{ lastPage: number }> {
     try {
-        const state = await ScraperState.findOne({ name: 'series' });
+        const state = await ScraperState.findOne({ name: 'animes' });
         return { lastPage: state?.lastPage || 1 };
     } catch {
         return { lastPage: 1 };
@@ -58,22 +34,20 @@ async function loadState(): Promise<{ lastPage: number }> {
 
 async function saveState(lastPage: number) {
     await ScraperState.findOneAndUpdate(
-        { name: 'series' },
+        { name: 'animes' },
         { $set: { lastPage, updatedAt: new Date() } },
         { upsert: true }
     );
 }
 
-async function scrapeSeriesDetails() {
-    console.log('[START] scrapeSeriesDetails() called — connecting to MongoDB...');
+async function scrapeAnimesDetails() {
+    console.log('[START] scrapeAnimesDetails() called — connecting to MongoDB...');
     await connectDB();
     console.log('[OK] MongoDB connected, launching Playwright...');
 
     const browser = await chromium.launch(browserConfig);
     console.log('[OK] Playwright browser launched');
     const page = await browser.newPage();
-    const apiKey = process.env.UQLOAD_API_KEY;
-    const uqload = apiKey ? new UqloadClient(apiKey) : null;
 
     let shuttingDown = false;
     process.on('SIGTERM', async () => {
@@ -90,7 +64,7 @@ async function scrapeSeriesDetails() {
     let hasMorePages = true;
 
     while (hasMorePages && !shuttingDown) {
-        const url = `https://www.open-otaku.me/?cat=series&page=${currentPage}`;
+        const url = `https://www.open-otaku.me/?type=animes&page=${currentPage}`;
         console.log(`\n--- Navigation vers ${url} ---`);
 
         await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
@@ -104,7 +78,7 @@ async function scrapeSeriesDetails() {
         }
 
         let cards = await page.$$('.fs-card');
-        console.log(`Séries trouvées sur la page : ${cards.length}`);
+        console.log(`Animes trouvés sur la page : ${cards.length}`);
 
         for (let i = 0; i < cards.length; i++) {
             try {
@@ -112,25 +86,25 @@ async function scrapeSeriesDetails() {
                 let card = currentCards[i];
                 let titre = await card.$eval('.fs-card-title', (el: any) => el.innerText.trim());
 
-                const existingSeries = await Serie.findOne({ titre: titre });
-                if (existingSeries && existingSeries.pageUrl && existingSeries.episodes && existingSeries.episodes.length > 0) {
-                    console.log(`Série déjà traitée et complète : ${titre}`);
+                const existingAnime = await Serie.findOne({ titre: titre });
+                if (existingAnime && existingAnime.pageUrl && existingAnime.episodes && existingAnime.episodes.length > 0) {
+                    console.log(`Anime déjà traité : ${titre}`);
                     continue;
                 }
 
-                console.log(`Traitement de la série : ${titre}`);
+                console.log(`Traitement de l'anime : ${titre}`);
                 await card.click();
                 await page.waitForLoadState('domcontentloaded');
                 await page.waitForTimeout(1000);
                 const pageUrl = page.url();
 
-                let serieData: any = { 
-                    titre: titre, 
-                    pageUrl: pageUrl, 
-                    episodes: existingSeries ? existingSeries.episodes : [] 
+                let animeData: any = { 
+                    titre, 
+                    pageUrl, 
+                    episodes: existingAnime ? existingAnime.episodes : [] 
                 };
 
-                if (serieData.episodes.length === 0) {
+                if (animeData.episodes.length === 0) {
                     console.log(`  -> Récupération des épisodes pour : ${titre}`);
                     while (true) {
                         await page.waitForSelector('#fs-episode-select', { state: 'attached', timeout: 10000 });
@@ -141,22 +115,16 @@ async function scrapeSeriesDetails() {
                         let link = dlLink ? await dlLink.getAttribute('href') : "#";
 
                         if (link && link !== "#") {
-                            // Parse the label so the schema gets the structured
-                            // season + episodeNumber fields it needs for
-                            // positional updates. Without this the
-                            // maintainer and the reupload module can't
-                            // reliably match episodes back.
                             const seasonMatch = titre.match(/Saison (\d+)/i);
                             const defaultSeason = seasonMatch ? parseInt(seasonMatch[1], 10) : 1;
                             const { season, episodeNumber, canonical } = parseEpisodeLabel(epTitre, defaultSeason);
-                            serieData.episodes.push({
+                            animeData.episodes.push({
                                 episode: canonical,
                                 season,
                                 episodeNumber,
                                 lien: link,
                             });
                         }
-                        // Supprimer la popup don qui bloque le clic
                         await page.evaluate(() => {
                             document.querySelector('#fs-donate-overlay')?.remove();
                         });
@@ -170,40 +138,41 @@ async function scrapeSeriesDetails() {
                 }
 
                 const saved = await Serie.findOneAndUpdate(
-                    { titre: titre },
-                    { $set: serieData },
+                    { titre },
+                    { $set: animeData },
                     { upsert: true, returnDocument: 'after' }
                 );
-                console.log(`Série enregistrée dans MongoDB : ${titre}`);
+                console.log(`Anime enregistré dans MongoDB : ${titre}`);
 
                 if (saved) {
-                    // Upload to BOTH Doodstream and Uqload. The reupload
-                    // module handles "already uploaded" via the fileCode
-                    // existence check, so re-running the scraper on the
-                    // same episodes is safe and idempotent.
                     for (let epIdx = 0; epIdx < (saved.episodes || []).length; epIdx++) {
                         const ep = saved.episodes[epIdx];
                         if (!ep.lien || ep.lien === "#") continue;
+                        if (ep.streamtapeCode) {
+                            console.log(`  -> ⏭ Déjà uploadé Streamtape : ${titre} - ${ep.episode}`);
+                            continue;
+                        }
                         const label = `${titre} - ${ep.episode}`;
-                        await reuploadEpisode(saved._id.toString(), ep, epIdx);
-                        // Keep the legacy Uqload path too — the new module
-                        // shares the same Uqload API so this is a no-op
-                        // when uqloadCode is already set, but the legacy
-                        // helper also writes `uqloadLink` which the new
-                        // module attempts but the upstream may not
-                        // surface. Both writes are idempotent.
-                        if (uqload && !ep.uqloadCode) {
-                            await uploadEpisodeToUqload(uqload, label, ep.lien, saved._id.toString(), epIdx);
+                        console.log(`  -> Upload Streamtape: ${label}`);
+                        const st = await uploadToStreamtape(ep.lien, label);
+                        if (st) {
+                            await Serie.updateOne(
+                                { _id: saved._id },
+                                { $set: { [`episodes.${epIdx}.streamtapeCode`]: st.linkId, [`episodes.${epIdx}.streamtapeLink`]: st.embedUrl } }
+                            );
+                            console.log(`  -> ✅ Streamtape: ${label} → ${st.embedUrl}`);
+                        } else {
+                            console.log(`  -> ⏭ Streamtape échoué pour ${label}`);
                         }
                     }
-                    // Liaison TMDB en arrière-plan (fire-and-forget)
+                    // Liaison TMDB en arrière-plan (fire-and-forget) — anime utilise le modèle Serie
                     autoLink('series', saved._id.toString());
                 }
 
                 await page.goto(url, { waitUntil: 'domcontentloaded' });
                 await page.waitForSelector('.fs-card');
             } catch (e) {
-                console.error(`Erreur sur la série :`, e);
+                console.error(`Erreur sur l'anime :`, e);
                 try {
                     await page.goto(url, { waitUntil: 'domcontentloaded' });
                     await page.waitForSelector('.fs-card');
@@ -217,11 +186,11 @@ async function scrapeSeriesDetails() {
     }
     await browser.close();
     await mongoose.disconnect();
-    console.log("Scraping terminé.");
+    console.log("Scraping animes terminé.");
 }
 
-scrapeSeriesDetails().catch((err) => {
-    console.log('[FATAL] scrapeSeriesDetails() crashed:', err?.message || err);
+scrapeAnimesDetails().catch((err) => {
+    console.log('[FATAL] scrapeAnimesDetails() crashed:', err?.message || err);
     console.error(err);
     process.exit(1);
 });

@@ -4,7 +4,8 @@ import bcrypt from 'bcryptjs';
 import axios from 'axios';
 import { AuthRequest } from './admin.middleware';
 import * as adminService from './admin.service';
-import { clearCache } from '../../config/tmdb';
+import tmdbClient, { clearCache } from '../../config/tmdb';
+import { publicFileUrl } from './media.upload';
 import { chromium } from 'playwright';
 import { appendLog } from '../../config/log-buffer';
 import Admin from '../../models/Admin';
@@ -14,6 +15,7 @@ import DeadLink from '../../models/DeadLink';
 import { startCron, stopCron, getCronStatus, runScrapingTasks, runMaintenanceTasks, runner, stopTask, getRunningTasks, runTaskById, runTaskByLabel, listOsProcesses, stopByPid, getSystemCronStatus, ALL_TASKS } from '../../cron-manager';
 import { UqloadClient } from '../uqload/uqload.client';
 import { uploadMoviesBatch, uploadSeriesBatch, uploadSingleMovie, uploadSingleEpisode, stopUpload, isUploadRunning } from '../uqload/uqload.uploader';
+import { autoLink } from '../../scraping/maintenance/auto-link';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'chiller-admin-secret-change-me';
 const SCRAPER_API_URL = process.env.SCRAPER_API_URL;
@@ -418,6 +420,9 @@ export async function triggerScrape(req: AuthRequest, res: Response) {
     }
     if (type === 'series' || type === 'all') {
         runner('Scraping Séries', 'scraping/core/scrape-series.js');
+    }
+    if (type === 'animes' || type === 'all') {
+        runner('Scraping Animes', 'scraping/core/scrape-animes.js');
     }
     res.json({ success: true, data: { status: 'launched', message: `Scraping ${type} lancé` }, message: null });
 }
@@ -936,4 +941,236 @@ export async function scrapperProxyPost(req: AuthRequest, res: Response) {
         console.error(`[ScraperProxy] POST ${endpoint}: ${e.message}`);
         res.status(502).json({ success: false, data: null, message: `Scraper injoignable: ${e.message}` });
     }
+}
+
+export async function tmdbSearch(req: AuthRequest, res: Response) {
+    const query = (req.query.query as string || '').trim();
+    const type = (req.query.type as string || 'movie') === 'tv' ? 'tv' : 'movie';
+    const year = req.query.year ? parseInt(req.query.year as string, 10) : undefined;
+    if (!query || query.length < 2) {
+        res.status(400).json({ success: false, data: null, message: 'Query requise (min 2 caractères)' });
+        return;
+    }
+    try {
+        const params: Record<string, any> = { query, page: 1 };
+        if (year) params.year = year;
+        const { data } = await tmdbClient.get(`/search/${type}`, { params });
+        const results = (data.results || []).slice(0, 6).map((r: any) => ({
+            id: r.id,
+            title: r.title || r.name || '',
+            year: r.release_date
+                ? new Date(r.release_date).getFullYear()
+                : r.first_air_date
+                    ? new Date(r.first_air_date).getFullYear()
+                    : null,
+            poster: r.poster_path ? `https://image.tmdb.org/t/p/w200${r.poster_path}` : null,
+        }));
+        res.json({ success: true, data: results, message: null });
+    } catch (e: any) {
+        res.status(500).json({ success: false, data: null, message: e.message });
+    }
+}
+
+export async function createManualMedia(req: AuthRequest, res: Response) {
+    const { type, titre, lien, tmdbId, year, episodes } = req.body || {};
+    const mediaType = type === 'serie' ? 'serie' : 'movie';
+
+    if (!titre || typeof titre !== 'string' || !titre.trim()) {
+        res.status(400).json({ success: false, data: null, message: 'Le titre est requis' });
+        return;
+    }
+    if (!tmdbId || isNaN(parseInt(tmdbId, 10))) {
+        res.status(400).json({ success: false, data: null, message: 'Le TMDB ID est requis' });
+        return;
+    }
+
+    try {
+        let result;
+        if (mediaType === 'movie') {
+            if (!lien || typeof lien !== 'string' || !lien.trim()) {
+                res.status(400).json({ success: false, data: null, message: 'Le lien est requis pour un film' });
+                return;
+            }
+            result = await createMovieRecord({ titre: titre.trim(), lien: lien.trim(), tmdbId: parseInt(tmdbId, 10), year });
+        } else {
+            if (!Array.isArray(episodes) || episodes.length === 0) {
+                res.status(400).json({ success: false, data: null, message: 'Au moins un épisode est requis pour une série' });
+                return;
+            }
+            const parsed = parseEpisodes(episodes, parseInt(tmdbId, 10));
+            if (typeof parsed === 'string') {
+                res.status(400).json({ success: false, data: null, message: parsed });
+                return;
+            }
+            result = await createSerieRecord({ titre: titre.trim(), episodes: parsed, tmdbId: parseInt(tmdbId, 10), year });
+        }
+        launchManualUpload(result._id.toString(), mediaType);
+        res.status(201).json({ success: true, data: { created: result, upload: uploadStatus() }, message: mediaType === 'movie' ? 'Film créé' : 'Série créée' });
+    } catch (e: any) {
+        if (e.code === 11000 || e.status === 409) {
+            res.status(409).json({ success: false, data: null, message: e.status === 409 ? e.message : `Le titre "${titre.trim()}" existe déjà` });
+            return;
+        }
+        res.status(500).json({ success: false, data: null, message: e.message });
+    }
+}
+
+export async function createManualMediaUpload(req: AuthRequest, res: Response) {
+    const { type, titre, tmdbId, year, episodesMeta } = req.body || {};
+    const files: Express.Multer.File[] = (req as any).files || [];
+    const mediaType = type === 'serie' ? 'serie' : 'movie';
+
+    if (!titre || typeof titre !== 'string' || !titre.trim()) {
+        res.status(400).json({ success: false, data: null, message: 'Le titre est requis' });
+        return;
+    }
+    if (!tmdbId || isNaN(parseInt(tmdbId, 10))) {
+        res.status(400).json({ success: false, data: null, message: 'Le TMDB ID est requis' });
+        return;
+    }
+
+    try {
+        let result;
+        if (mediaType === 'movie') {
+            const file = files[0];
+            if (!file) {
+                res.status(400).json({ success: false, data: null, message: 'Aucun fichier vidéo reçu pour le film' });
+                return;
+            }
+            result = await createMovieRecord({ titre: titre.trim(), lien: publicFileUrl(file.filename), tmdbId: parseInt(tmdbId, 10), year });
+        } else {
+            let metas: any[] = [];
+            try {
+                metas = episodesMeta ? JSON.parse(episodesMeta) : [];
+            } catch {
+                res.status(400).json({ success: false, data: null, message: 'episodesMeta invalide (JSON attendu)' });
+                return;
+            }
+            if (!Array.isArray(metas) || metas.length === 0) {
+                res.status(400).json({ success: false, data: null, message: 'Au moins un épisode est requis pour une série' });
+                return;
+            }
+            let fileIdx = 0;
+            const withLinks: any[] = metas.map((meta: any) => {
+                if (meta.lien && (meta.lien as string).trim()) {
+                    return { ...meta, lien: meta.lien.trim() };
+                }
+                const file = files[fileIdx++];
+                if (!file) return null;
+                return { ...meta, lien: publicFileUrl(file.filename) };
+            });
+            if (withLinks.some(ep => !ep)) {
+                res.status(400).json({ success: false, data: null, message: `Il manque ${files.length - fileIdx + 1} fichier(s) pour les épisodes renseignés` });
+                return;
+            }
+            const parsed = parseEpisodes(withLinks, parseInt(tmdbId, 10));
+            if (typeof parsed === 'string') {
+                res.status(400).json({ success: false, data: null, message: parsed });
+                return;
+            }
+            result = await createSerieRecord({ titre: titre.trim(), episodes: parsed, tmdbId: parseInt(tmdbId, 10), year });
+        }
+        launchManualUpload(result._id.toString(), mediaType);
+        res.status(201).json({ success: true, data: { created: result, upload: uploadStatus() }, message: mediaType === 'movie' ? 'Film créé' : 'Série créée' });
+    } catch (e: any) {
+        if (e.code === 11000 || e.status === 409) {
+            res.status(409).json({ success: false, data: null, message: e.status === 409 ? e.message : `Le titre "${titre.trim()}" existe déjà` });
+            return;
+        }
+        res.status(500).json({ success: false, data: null, message: e.message });
+    }
+}
+
+async function createMovieRecord({ titre, lien, tmdbId, year }: { titre: string; lien: string; tmdbId: number; year?: any }) {
+    const existing = await Movie.findOne({ titre });
+    if (existing) {
+        const err: any = new Error(`Un film nommé "${titre}" existe déjà`);
+        err.status = 409;
+        throw err;
+    }
+    const created = await Movie.create({
+        titre,
+        pageUrl: lien,
+        lien,
+        tmdbId,
+        ...(year && !isNaN(parseInt(year, 10)) ? { year: parseInt(year, 10) } : {}),
+    });
+    // En arrière-plan : re-valide le TMDB et enrichit les métadonnées.
+    autoLink('movie', created._id.toString());
+    return created;
+}
+
+async function createSerieRecord({ titre, episodes, tmdbId, year }: { titre: string; episodes: any[]; tmdbId: number; year?: any }) {
+    const existing = await Serie.findOne({ titre });
+    if (existing) {
+        const err: any = new Error(`Une série nommée "${titre}" existe déjà`);
+        err.status = 409;
+        throw err;
+    }
+    const created = await Serie.create({
+        titre,
+        pageUrl: episodes[0].lien,
+        episodes,
+        tmdbId,
+        ...(year && !isNaN(parseInt(year, 10)) ? { year: parseInt(year, 10) } : {}),
+    });
+    // En arrière-plan : re-valide le TMDB et enrichit les métadonnées.
+    autoLink('series', created._id.toString());
+    return created;
+}
+
+function parseEpisodes(episodes: any[], tmdbId: number): any[] | string {
+    const parsed: any[] = [];
+    for (let i = 0; i < episodes.length; i++) {
+        const ep = episodes[i] || {};
+        const season = parseInt(ep.season, 10);
+        const episodeNumber = parseInt(ep.episodeNumber, 10);
+        const epLien = (ep.lien || '').trim();
+        if (!season || !episodeNumber) {
+            return `Épisode ${i + 1}: saison et numéro sont requis`;
+        }
+        if (!epLien) {
+            return `Épisode ${i + 1} (S${season}E${episodeNumber}): lien requis`;
+        }
+        parsed.push({
+            episode: ep.episode || `S${String(season).padStart(2, '0')}E${String(episodeNumber).padStart(2, '0')}`,
+            season,
+            episodeNumber,
+            lien: epLien,
+            tmdbId,
+        });
+    }
+    return parsed;
+}
+
+function uploadStatus() {
+    const client = getUqloadClient();
+    if (!client) {
+        return { started: false, message: 'UQLOAD_API_KEY non configurée — le record est créé, upload manuel via la page Uqload' };
+    }
+    if (isUploadRunning()) {
+        return { started: false, message: 'Un upload Uqload est déjà en cours — le record restera dans la file' };
+    }
+    return { started: true, message: 'Upload Uqload lancé en arrière-plan' };
+}
+
+function launchManualUpload(id: string, type: 'movie' | 'serie') {
+    const client = getUqloadClient();
+    if (!client || isUploadRunning()) return;
+    (async () => {
+        try {
+            if (type === 'movie') {
+                await uploadSingleMovie(client, id);
+            } else {
+                const serie = await Serie.findById(id);
+                if (!serie) return;
+                for (let i = 0; i < serie.episodes.length; i++) {
+                    if (isUploadRunning()) break;
+                    await uploadSingleEpisode(client, id, i);
+                }
+            }
+        } catch (e: any) {
+            console.error(`[ManualUpload] Erreur ${type} ${id}:`, e.message);
+        }
+    })();
 }

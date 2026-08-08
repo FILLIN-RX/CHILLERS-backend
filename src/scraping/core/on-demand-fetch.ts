@@ -3,6 +3,7 @@ import { chromium } from 'playwright';
 import { browserConfig } from '../../config/browser';
 import Movie from '../../models/Movie';
 import Serie from '../../models/Serie';
+import { autoLink } from '../maintenance/auto-link';
 
 /**
  * Recherche et récupère les informations pour un film ou une série s'il est manquant
@@ -26,11 +27,13 @@ export async function fetchMissingMedia(title: string, type: 'movie' | 'series',
         if (link) {
             result = { titre: title, episode: `Ép ${episodeNum}`, lien: link };
             // Update MongoDB Serie
-            await Serie.findOneAndUpdate(
+            const updated = await Serie.findOneAndUpdate(
                 { titre: title },
                 { $push: { episodes: { episode: `Ép ${episodeNum}`, lien: link } } },
-                { upsert: true }
+                { upsert: true, returnDocument: 'after' }
             );
+            // Liaison TMDB en arrière-plan (fire-and-forget)
+            if (updated?._id) autoLink('series', updated._id.toString());
         }
     } else {
         const dlBtn = page.locator('button#fs-quick-download');
@@ -41,11 +44,13 @@ export async function fetchMissingMedia(title: string, type: 'movie' | 'series',
         result = { titre: title, lien: link };
 
         // Update MongoDB Movie
-        await Movie.findOneAndUpdate(
+        const updated = await Movie.findOneAndUpdate(
             { titre: title },
             { $set: { titre: title, pageUrl: page.url(), lien: link } },
-            { upsert: true }
+            { upsert: true, returnDocument: 'after' }
         );
+        // Liaison TMDB en arrière-plan (fire-and-forget)
+        if (updated?._id) autoLink('movie', updated._id.toString());
     }
 
     await browser.close();

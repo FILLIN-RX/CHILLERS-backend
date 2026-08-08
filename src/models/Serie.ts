@@ -22,8 +22,14 @@ export interface ISerie extends Document {
     pageUrl: string;
     episodes: IEpisode[];
     tmdbId?: number;
+    year?: number;
     createdAt: Date;
     updatedAt: Date;
+    posterUrl?: string;
+    posterSource?: string;
+    speech?: string;
+    disponible?: boolean;
+    disponibleCheckedAt?: Date;
 }
 
 const EpisodeSchema: Schema = new Schema({
@@ -47,7 +53,13 @@ const SerieSchema: Schema = new Schema({
     titre: { type: String, required: true, unique: true },
     pageUrl: { type: String, required: true },
     episodes: [EpisodeSchema],
-    tmdbId: { type: Number, index: true }
+    tmdbId: { type: Number, index: true },
+    year: { type: Number },
+    posterUrl: { type: String },
+    posterSource: { type: String, enum: ['tmdb', 'web', 'ai', 'none'], default: undefined },
+    speech: { type: String },
+    disponible: { type: Boolean },
+    disponibleCheckedAt: { type: Date },
 }, { timestamps: true });
 
 // Index composé pour accélérer le lookup du provider (titre + S/E)

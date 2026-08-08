@@ -40,7 +40,32 @@ export class DirectProvider implements StreamingProvider {
       : `"${query.title}" (tmdb=${query.tmdbId})`;
     console.log(`${TAG} resolve ${label}`);
 
-    // 1. Cherche l'embed URL dans MongoDB ou le JSON
+    // 1. PRIORITÉ UQLOAD : dès qu'un file code Uqload existe, on valide le
+    //    fichier via l'API uqload.is/api (joignable depuis le serveur), puis
+    //    on renvoie l'iframe embed. Le CDN Uqload bloque l'IP du serveur :
+    //    impossible de proxyé le flux, c'est donc le navigateur qui lit
+    //    l'iframe (son IP n'est pas bloquée). Doodstream ne prend la main
+    //    que si l'API échoue ou qu'aucun code Uqload n'existe.
+    const uqloadCode = await this.findUqloadCode(query);
+    if (uqloadCode) {
+      const uqloadEmbedUrl = `https://uqload.is/embed-${uqloadCode}.html`;
+      console.log(`${TAG} ${label} → Uqload prioritaire (${uqloadEmbedUrl})`);
+      const t1 = Date.now();
+      const scrapedU = await scrapeDirectStream(uqloadEmbedUrl, true);
+      if (scrapedU) {
+        console.log(`${TAG} ${label} → UQLOAD VALIDÉ en ${Date.now() - t1}ms (${scrapedU.type})`);
+        console.log(`${TAG}   embedUrl: ${uqloadEmbedUrl}`);
+        this.updateMongoDbFreshUrl(query, scrapedU.directUrl, scrapedU.type).catch(() => {});
+        return {
+          provider: this.name,
+          embedUrl: uqloadEmbedUrl,
+          type: query.season !== undefined ? 'episode' : 'movie',
+        };
+      }
+      console.log(`${TAG} ${label} → API Uqload échouée, fallback embed Doodstream`);
+    }
+
+    // 2. Fallback : embed stocké (Doodstream/vidzy) scrapé en URL directe
     const embedUrl = await this.findEmbedUrl(query);
     if (!embedUrl) {
       console.log(`${TAG} ${label} → pas d'embed URL trouvée, skip`);
@@ -48,40 +73,25 @@ export class DirectProvider implements StreamingProvider {
     }
     console.log(`${TAG} ${label} → embed URL trouvée: ${embedUrl.slice(0, 100)}`);
 
-    // 2. Vérifie que c'est un embed scrapable (Doodstream ou Uqload)
+    // 3. Vérifie que c'est un embed scrapable (Doodstream ou Uqload)
     if (!isScrapableUrl(embedUrl)) {
       console.log(`${TAG} ${label} → URL non scrapable (ni Doodstream ni Uqload), skip`);
       return null;
     }
 
-    // 3. Scrape pour extraire l'URL directe
+    // 4. Scrape pour extraire l'URL directe
     console.log(`${TAG} ${label} → lancement du scrape de ${embedUrl.slice(0, 80)}...`);
     const t0 = Date.now();
-    let scraped = await scrapeDirectStream(embedUrl, true);
-    let elapsed = Date.now() - t0;
-
-    // 3b. Si le scrape Doodstream échoue (Cloudflare 403), tente l'embed Uqload
-    if (!scraped) {
-      const uqloadCode = await this.findUqloadCode(query);
-      if (uqloadCode) {
-        const uqloadEmbedUrl = `https://uqload.is/embed-${uqloadCode}.html`;
-        console.log(`${TAG} ${label} → Doodstream échoué, tentative Uqload (${uqloadEmbedUrl})...`);
-        const t1 = Date.now();
-        scraped = await scrapeDirectStream(uqloadEmbedUrl, true);
-        elapsed = Date.now() - t1;
-      }
-    }
+    const scraped = await scrapeDirectStream(embedUrl, true);
+    const elapsed = Date.now() - t0;
 
     if (!scraped) {
       console.log(`${TAG} ${label} → scrape échoué en ${elapsed}ms, fallback aux providers suivants`);
       return null;
     }
 
-    // 4. Construit l'URL proxy (backend pipe le flux avec les bons headers)
+    // 5. Construit l'URL proxy (backend pipe le flux avec les bons headers)
     const proxyUrl = `/api/doodstream/stream?url=${encodeURIComponent(scraped.directUrl)}&referer=${encodeURIComponent(scraped.referer)}`;
-
-    // 5. Update MongoDB with fresh URL so next request is instant
-    this.updateMongoDbFreshUrl(query, scraped.directUrl).catch(() => {});
 
     console.log(`${TAG} ${label} → SCRAPE RÉUSSI en ${elapsed}ms`);
     console.log(`${TAG}   type: ${scraped.type}`);
@@ -134,27 +144,17 @@ export class DirectProvider implements StreamingProvider {
   private async findUqloadCode(query: StreamQuery): Promise<string | null> {
     try {
       if (query.season !== undefined && query.episode !== undefined) {
-        const serie = await Serie.findOne({
-          $or: [
-            ...(query.tmdbId ? [{ tmdbId: query.tmdbId }] : []),
-            ...(query.title ? [{ titre: { $regex: new RegExp(query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }] : []),
-          ],
-        }).exec();
+        const serie = await this.findSerie(query);
         if (!serie) return null;
         const ep = serie.episodes.find(
           (e: any) => Number(e.season) === Number(query.season) && Number(e.episodeNumber) === Number(query.episode)
         );
-        if (ep?.uqloadCode && ep.uqloadLink) return ep.uqloadCode;
+        if (ep?.uqloadCode) return ep.uqloadCode;
         return null;
       } else {
-        const movie = await Movie.findOne({
-          $or: [
-            ...(query.tmdbId ? [{ tmdbId: query.tmdbId }] : []),
-            ...(query.title ? [{ titre: { $regex: new RegExp(query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }] : []),
-          ],
-        }).exec();
+        const movie = await this.findMovie(query);
         if (!movie) return null;
-        if (movie.uqloadCode && movie.uqloadLink) return movie.uqloadCode;
+        if (movie.uqloadCode) return movie.uqloadCode;
         return null;
       }
     } catch (err) {
@@ -166,17 +166,14 @@ export class DirectProvider implements StreamingProvider {
   private async findFromMongoDB(query: StreamQuery): Promise<string | null> {
     try {
       if (query.season !== undefined && query.episode !== undefined) {
-        const serie = await Serie.findOne({
-          $or: [
-            ...(query.tmdbId ? [{ tmdbId: query.tmdbId }] : []),
-            ...(query.title ? [{ titre: { $regex: new RegExp(query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }] : []),
-          ],
-        }).exec();
+        const serie = await this.findSerie(query);
 
         if (!serie) {
-          console.log(`${TAG} MongoDB: série introuvable pour tmdbId=${query.tmdbId}`);
+          console.log(`${TAG} MongoDB: série introuvable pour tmdbId=${query.tmdbId} title="${query.title}"`);
           return null;
         }
+
+        console.log(`${TAG} MongoDB: série trouvée "${serie.titre}" (tmdbId=${serie.tmdbId})`);
 
         const ep = serie.episodes.find(
           (e: any) => Number(e.season) === Number(query.season) && Number(e.episodeNumber) === Number(query.episode)
@@ -202,17 +199,14 @@ export class DirectProvider implements StreamingProvider {
 
         return this.toEmbedUrl(lien);
       } else {
-        const movie = await Movie.findOne({
-          $or: [
-            ...(query.tmdbId ? [{ tmdbId: query.tmdbId }] : []),
-            ...(query.title ? [{ titre: { $regex: new RegExp(query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }] : []),
-          ],
-        }).exec();
+        const movie = await this.findMovie(query);
 
         if (!movie) {
-          console.log(`${TAG} MongoDB: film introuvable pour tmdbId=${query.tmdbId}`);
+          console.log(`${TAG} MongoDB: film introuvable pour tmdbId=${query.tmdbId} title="${query.title}"`);
           return null;
         }
+
+        console.log(`${TAG} MongoDB: film trouvé "${movie.titre}" (tmdbId=${movie.tmdbId})`);
 
         const lien = movie.lien;
         if (!lien || lien === '#') {
@@ -232,6 +226,42 @@ export class DirectProvider implements StreamingProvider {
       }
     } catch (err) {
       console.error(`${TAG} MongoDB lookup error:`, err);
+    }
+    return null;
+  }
+
+  private async findSerie(query: StreamQuery): Promise<any> {
+    // Priority 1: exact tmdbId match
+    if (query.tmdbId) {
+      const byId = await Serie.findOne({ tmdbId: query.tmdbId }).exec();
+      if (byId) return byId;
+    }
+    // Priority 2: title regex fallback
+    if (query.title) {
+      const escaped = query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const byTitle = await Serie.findOne({ titre: { $regex: new RegExp(escaped, 'i') } }).exec();
+      if (byTitle) {
+        console.log(`${TAG} findSerie: matched by title "${byTitle.titre}" (tmdbId=${byTitle.tmdbId}) for query tmdbId=${query.tmdbId}`);
+        return byTitle;
+      }
+    }
+    return null;
+  }
+
+  private async findMovie(query: StreamQuery): Promise<any> {
+    // Priority 1: exact tmdbId match
+    if (query.tmdbId) {
+      const byId = await Movie.findOne({ tmdbId: query.tmdbId }).exec();
+      if (byId) return byId;
+    }
+    // Priority 2: title regex fallback
+    if (query.title) {
+      const escaped = query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const byTitle = await Movie.findOne({ titre: { $regex: new RegExp(escaped, 'i') } }).exec();
+      if (byTitle) {
+        console.log(`${TAG} findMovie: matched by title "${byTitle.titre}" (tmdbId=${byTitle.tmdbId}) for query tmdbId=${query.tmdbId}`);
+        return byTitle;
+      }
     }
     return null;
   }
@@ -269,33 +299,31 @@ export class DirectProvider implements StreamingProvider {
     return null;
   }
 
-  private async updateMongoDbFreshUrl(query: StreamQuery, freshUrl: string): Promise<void> {
+  private async updateMongoDbFreshUrl(query: StreamQuery, freshUrl: string, type?: string): Promise<void> {
     try {
+      // Seuls les liens MP4 directs sont stockés dans uqloadLink : un lien
+      // HLS (.m3u8) signé est éphémère et casserait le téléchargement qui
+      // attend un fichier .mp4.
+      if (type !== undefined && type !== 'mp4') {
+        console.log(`${TAG} type=${type}, pas de mise à jour de uqloadLink (mp4 uniquement)`);
+        return;
+      }
       if (query.season !== undefined && query.episode !== undefined) {
-        const serie = await Serie.findOne({
-          $or: [
-            ...(query.tmdbId ? [{ tmdbId: query.tmdbId }] : []),
-            ...(query.title ? [{ titre: { $regex: new RegExp(query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }] : []),
-          ],
-        }).exec();
-        if (!serie) return;
-        const ep = serie.episodes.find(
-          (e: any) => Number(e.season) === Number(query.season) && Number(e.episodeNumber) === Number(query.episode)
-        );
-        if (ep?.uqloadCode) {
-          await Serie.updateOne(
-            { _id: serie._id, 'episodes.uqloadCode': ep.uqloadCode },
-            { $set: { 'episodes.$.uqloadLink': freshUrl } }
+        const serie = await this.findSerie(query);
+        if (serie) {
+          const ep = serie.episodes.find(
+            (e: any) => Number(e.season) === Number(query.season) && Number(e.episodeNumber) === Number(query.episode)
           );
-          console.log(`${TAG} MongoDB updated uqloadLink for episode "${query.title}" S${query.season}E${query.episode}`);
+          if (ep?.uqloadCode) {
+            await Serie.updateOne(
+              { _id: serie._id, 'episodes.uqloadCode': ep.uqloadCode },
+              { $set: { 'episodes.$.uqloadLink': freshUrl } }
+            );
+            console.log(`${TAG} MongoDB updated uqloadLink for episode "${query.title}" S${query.season}E${query.episode}`);
+          }
         }
       } else {
-        const movie = await Movie.findOne({
-          $or: [
-            ...(query.tmdbId ? [{ tmdbId: query.tmdbId }] : []),
-            ...(query.title ? [{ titre: { $regex: new RegExp(query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }] : []),
-          ],
-        }).exec();
+        const movie = await this.findMovie(query);
         if (movie?.uqloadCode) {
           await Movie.updateOne(
             { _id: movie._id },

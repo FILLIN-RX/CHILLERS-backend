@@ -19,7 +19,7 @@ function normalize(str: string): string {
   return str
     .toLowerCase()
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[̀-ͯ]/g, '')
     .replace(/[^a-z0-9 ]/g, ' ')
     .replace(/\s+/g, ' ')
     .trim();
@@ -84,6 +84,110 @@ async function getSeasonDetails(tmdbId: number, seasonNumber: number): Promise<a
   }
 }
 
+/**
+ * Lie une série MongoDB à son ID TMDB. Utilisable depuis un save-site (auto-link)
+ * ou depuis le batch main(). Ne lève jamais — retourne un statut structuré.
+ *
+ * Stratégie de match (du plus précis au plus relâché) :
+ *   1) Similarité de titre ≥ 0.5 OU (similarité ≥ 0.3 ET candidat #0)
+ *   2) Saison existe dans TMDB
+ *   3) Au moins un match de titre d'épisode entre upload et TMDB
+ *   4) Nombre exact d'épisodes entre upload et TMDB
+ *   5) uploaded ≤ tmdb ET chevauchement sur au moins un numéro d'épisode
+ */
+export async function linkSeriesTmdb(serieId: string): Promise<{ ok: boolean; tmdbId?: number; reason?: string }> {
+  try {
+    const serie: any = await Serie.findById(serieId).select('titre episodes tmdbId').lean();
+    if (!serie) return { ok: false, reason: 'not_found' };
+    if (serie.tmdbId) return { ok: true, tmdbId: serie.tmdbId };
+
+    const parsed = parseTitre(serie.titre);
+    if (!parsed) return { ok: false, reason: 'unparseable_titre' };
+
+    const { seriesName, season } = parsed;
+
+    // Reconstituer le "groupe" : pour une Serie unique, c'est juste cette série.
+    const group = {
+      entries: [serie],
+      season,
+      maxEpisode: serie.episodes.length > 0
+        ? Math.max(...serie.episodes.map((e: any) => e.episodeNumber ?? 0), 0)
+        : 0,
+    };
+    const uploadedCount = group.maxEpisode;
+
+    const results = await searchTmdb(seriesName);
+    if (results.length === 0) return { ok: false, reason: 'no_tmdb_results' };
+
+    for (let i = 0; i < Math.min(3, results.length); i++) {
+      const candidate = results[i];
+      const sim = nameSimilarity(seriesName, candidate.name || '');
+      if (sim < 0.3) continue;
+      if (sim < 0.5 && i !== 0) continue;
+
+      const details = await getTvDetails(candidate.id);
+      if (!details) continue;
+
+      const seasons = details.seasons || [];
+      const seasonExists = seasons.some((s: any) => s.season_number === season);
+      if (!seasonExists) continue;
+
+      const seasonDetail = await getSeasonDetails(candidate.id, season);
+      if (!seasonDetail) continue;
+
+      const tmdbEpisodes = seasonDetail.episodes || [];
+      const tmdbCount = tmdbEpisodes.length;
+
+      // Match par titres d'épisodes
+      const uploadedEpTitles: { ep: number; title: string | null }[] = [];
+      for (const s of group.entries) {
+        for (const ep of s.episodes) {
+          const filename = (ep.lien || '').split('/').pop()?.split('?')[0] || '';
+          uploadedEpTitles.push({ ep: ep.episodeNumber, title: extractEpisodeTitleFromFilename(filename) });
+        }
+      }
+      const titleMatches = uploadedEpTitles.filter(u => {
+        if (!u.title) return false;
+        const tmdbEp = tmdbEpisodes.find((te: any) => te.episode_number === u.ep);
+        if (!tmdbEp || !tmdbEp.name) return false;
+        return nameSimilarity(u.title, tmdbEp.name) > 0.4;
+      });
+      if (titleMatches.length > 0) {
+        await Serie.updateMany({ titre: serie.titre }, { $set: { tmdbId: candidate.id } });
+        console.log(`[TMDB-AUTO] Series "${serie.titre}" → tmdbId=${candidate.id} (match titres épisodes)`);
+        return { ok: true, tmdbId: candidate.id };
+      }
+
+      // Fallback : nombre exact d'épisodes
+      if (tmdbCount === uploadedCount) {
+        await Serie.updateMany({ titre: serie.titre }, { $set: { tmdbId: candidate.id } });
+        console.log(`[TMDB-AUTO] Series "${serie.titre}" → tmdbId=${candidate.id} (count match)`);
+        return { ok: true, tmdbId: candidate.id };
+      }
+
+      // Fallback relâché : uploaded ≤ tmdb + chevauchement d'au moins un numéro d'épisode
+      if (uploadedCount <= tmdbCount && uploadedCount > 0) {
+        const uploadedEpNumbers = new Set<number>();
+        for (const s of group.entries) {
+          for (const ep of s.episodes) uploadedEpNumbers.add(ep.episodeNumber);
+        }
+        const tmdbEpNumbers = new Set(tmdbEpisodes.map((e: any) => e.episode_number));
+        const anyNumMatch = [...uploadedEpNumbers].some(n => tmdbEpNumbers.has(n));
+        if (anyNumMatch) {
+          await Serie.updateMany({ titre: serie.titre }, { $set: { tmdbId: candidate.id } });
+          console.log(`[TMDB-AUTO] Series "${serie.titre}" → tmdbId=${candidate.id} (relaxed match)`);
+          return { ok: true, tmdbId: candidate.id };
+        }
+      }
+    }
+
+    return { ok: false, reason: 'no_match' };
+  } catch (err: any) {
+    console.error(`[TMDB-AUTO] Series ${serieId} failed:`, err.message);
+    return { ok: false, reason: 'exception' };
+  }
+}
+
 async function main() {
   await connectDB();
 
@@ -93,7 +197,7 @@ async function main() {
 
   if (allSeries.length === 0) {
     console.log('Aucune série à lier (toutes ont déjà un tmdbId).');
-    return;
+    process.exit(0);
   }
 
   // Group by titre + season (each Serie doc = one season)
@@ -251,4 +355,7 @@ async function main() {
   process.exit(0);
 }
 
-main().catch(err => { console.error('[FATAL]', err); process.exit(1); });
+// Exécuter main() uniquement si le script est lancé directement (pas en import).
+if (require.main === module) {
+  main().catch(err => { console.error('[FATAL]', err); process.exit(1); });
+}

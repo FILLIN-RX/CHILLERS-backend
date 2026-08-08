@@ -22,6 +22,7 @@ const GRACEFUL_KILL_MS = 5000;
 export const ALL_TASKS: Record<string, { label: string; path: string; command: 'tsx' | 'node' }> = {
     'scraping-films':           { label: 'Scraping Films',            path: 'scraping/core/scrape-films.js',                 command: 'node' },
     'scraping-series':          { label: 'Scraping Séries',           path: 'scraping/core/scrape-series.ts',                command: 'tsx' },
+    'scraping-animes':          { label: 'Scraping Animes',           path: 'scraping/core/scrape-animes.ts',                command: 'tsx' },
     'maintenance-liens':        { label: 'Maintenance Liens',         path: 'scraping/maintenance/maintainer.ts',           command: 'tsx' },
     'reparation-films':         { label: 'Réparation Films',          path: 'scraping/maintenance/maintainer-movies.ts',    command: 'tsx' },
     'check-all-links':          { label: 'Vérification Liens Morts',  path: 'scraping/maintenance/check-all-links.ts',      command: 'tsx' },
@@ -328,6 +329,7 @@ export function runScrapingTasks() {
     console.log(`[${new Date().toISOString()}] [Cron] Lancement des tâches de scraping...`);
     runner('Scraping Films', 'scraping/core/scrape-films.js');
     runner('Scraping Séries', 'scraping/core/scrape-series.js');
+    runner('Scraping Animes', 'scraping/core/scrape-animes.js');
 }
 
 export function runMaintenanceTasks() {

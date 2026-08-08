@@ -75,11 +75,11 @@ export class MongoDBProvider implements StreamingProvider {
       if (!movie) return null;
 
       // Priorité au streaming Uqload via son lecteur iframe (embed-<code>.html)
-      // dès qu'un fichier Uqload est prêt (uqloadCode + uqloadLink confirmé).
-      // On n'utilise PAS le lien direct .mp4 pour le streaming : il est signé,
+      // dès qu'un fichier Uqload est prêt (uqloadCode présent). Le lien
+      // direct .mp4 n'est PAS utilisé pour le streaming : il est signé,
       // éphémère et servi depuis un CDN non whitelisté (CSP media-src) → il ne
       // sert qu'au téléchargement. L'iframe Uqload ne périme pas.
-      if (movie.uqloadCode && movie.uqloadLink) {
+      if (movie.uqloadCode) {
         return { provider: this.name, embedUrl: uqloadEmbedUrl(movie.uqloadCode), type: 'movie' };
       }
 
@@ -128,7 +128,7 @@ export class MongoDBProvider implements StreamingProvider {
       if (!ep) return null;
 
       // Priorité au lecteur iframe Uqload quand le fichier est prêt.
-      if (ep.uqloadCode && ep.uqloadLink) {
+      if (ep.uqloadCode) {
         return { provider: this.name, embedUrl: uqloadEmbedUrl(ep.uqloadCode), type: 'episode' };
       }
 

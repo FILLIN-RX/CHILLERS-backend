@@ -6,6 +6,7 @@ const ScraperState = require('../../models/ScraperState').default;
 const { connectDB } = require('../../config/db');
 const { browserConfig } = require('../../config/browser');
 const { UqloadClient } = require('../../modules/uqload/uqload.client');
+const { autoLink } = require('../maintenance/auto-link');
 
 async function uploadToUqload(client, titre, lien, movieId) {
   if (!client) return;
@@ -150,6 +151,8 @@ async function scrapeFilms() {
                     if (saved) {
                         await uploadToUqload(uqload, titre, link, saved._id.toString());
                         await uploadToDoodStream(titre, link, saved._id.toString());
+                        // Liaison TMDB en arrière-plan (fire-and-forget)
+                        autoLink('movie', saved._id.toString());
                     }
                 }
 

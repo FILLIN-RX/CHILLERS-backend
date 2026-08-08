@@ -1,4 +1,7 @@
 import axios from 'axios';
+import https from 'https';
+
+const ipv4Agent = new https.Agent({ family: 4, keepAlive: true });
 
 export interface DirectStreamResult {
   directUrl: string;
@@ -13,6 +16,37 @@ const TAG = '[DirectScraper]';
 
 function isDirectVideoUrl(url: string): boolean {
   return /\.(mp4|webm|m3u8|ts|m4s)(\?|$)/i.test(url);
+}
+
+/**
+ * HEAD puis GET de secours : vérifie qu'une URL signée répond sans 403.
+ * Le CDN Uqload renvoie un 403 sur les liens dont le token est incomplet
+ * (hls_direct sans paramètre `v`) — on valide donc avant de les diffuser.
+ */
+async function isUrlReachable(url: string, referer: string): Promise<boolean> {
+  try {
+    await axios.head(url, {
+      timeout: 8000,
+      httpsAgent: ipv4Agent,
+      validateStatus: (s) => s >= 200 && s < 400,
+      headers: { 'User-Agent': UA, Referer: referer },
+    });
+    return true;
+  } catch {
+    try {
+      const res = await axios.get(url, {
+        timeout: 8000,
+        httpsAgent: ipv4Agent,
+        responseType: 'stream',
+        validateStatus: (s) => s >= 200 && s < 400,
+        headers: { 'User-Agent': UA, Referer: referer },
+      });
+      res.data.destroy();
+      return true;
+    } catch {
+      return false;
+    }
+  }
 }
 
 /** Decode P.A.C.K.E.R. obfuscated JavaScript (eval(function(p,a,c,k,e,d){...})) */
@@ -336,62 +370,69 @@ async function getUqloadDirectLink(fileCode: string, preferHls = false): Promise
     return null;
   }
 
-  // Pour le download : cloner d'abord pour obtenir un nouveau filecode (CDN bypass)
-  const targetCode = preferHls ? fileCode : await cloneFileCode(fileCode);
+  // Pour le download : on essaie le code original en premier (les clones ne
+  // renvoient parfois que du HLS), puis clone en secours si aucun MP4.
+  // HLS mode (streaming/download) : code original puis clone, l'HLS étant
+  // prioritaire (le MP4 direct de l'API renvoie un 403 côté CDN).
+  const codes = [fileCode, await cloneFileCode(fileCode)];
 
-  try {
-    const apiUrl = `https://uqload.is/api/file/direct_link?key=${UQLOAD_API_KEY}&file_code=${targetCode}${preferHls ? '&hls=1' : ''}`;
-    console.log(`${TAG} Uqload API: GET ${apiUrl}${preferHls ? ' (HLS mode)' : ' (MP4 mode)'}`);
-    const { data } = await axios.get(apiUrl, { timeout: 10000 });
-    console.log(`${TAG} Uqload API: status=${data.status}, msg=${data.msg}`);
+  for (const targetCode of codes) {
+    try {
+      const apiUrl = `https://uqload.is/api/file/direct_link?key=${UQLOAD_API_KEY}&file_code=${targetCode}${preferHls ? '&hls=1' : ''}`;
+      console.log(`${TAG} Uqload API: GET ${apiUrl}${preferHls ? ' (HLS mode)' : ' (MP4 mode)'}`);
+      const { data } = await axios.get(apiUrl, { timeout: 10000 });
+      console.log(`${TAG} Uqload API: status=${data.status}, msg=${data.msg}`);
 
-    if (data.status !== 200 || !data.result) {
-      console.log(`${TAG} Uqload API: échec`);
-      return null;
+      if (data.status !== 200 || !data.result) {
+        console.log(`${TAG} Uqload API: échec`);
+        continue;
+      }
+
+      const result = data.result as UqloadDirectLinkResult;
+
+      // Préférer HLS pour le streaming, MP4 pour le download
+      if (preferHls && result.hls_direct) {
+        // Le hls_direct de l'API est parfois incomplet (pas de paramètre
+        // `v`) → le CDN répond 403. On valide avant de le renvoyer, sinon
+        // on laisse l'extraction P.A.C.K.E.R. de la page embed fournir le
+        // bon lien (porteur du view id).
+        if (await isUrlReachable(result.hls_direct, 'https://uqload.is/')) {
+          console.log(`${TAG} Uqload API: ✅ HLS direct → ${result.hls_direct.slice(0, 120)}`);
+          return {
+            directUrl: result.hls_direct,
+            type: 'hls',
+            referer: 'https://uqload.is/',
+          };
+        }
+        console.log(`${TAG} Uqload API: ⚠ hls_direct rejeté par le CDN (403), fallback page embed`);
+        continue;
+      }
+
+      // En mode MP4 : fallback to highest quality .mp4 (ou seul .mp4).
+      // En mode HLS : un .mp4 brut est inutilisable pour le proxy FFmpeg
+      // (le CDN le renvoie en 403), on passe donc au code suivant.
+      if (!preferHls) {
+        const versions = result.versions || [];
+        const qualityOrder: Record<string, number> = { o: 10, h: 8, n: 5, l: 2 };
+        const sorted = [...versions].sort((a, b) => (qualityOrder[b.name] || 0) - (qualityOrder[a.name] || 0));
+        if (sorted.length > 0) {
+          const best = sorted[0];
+          console.log(`${TAG} Uqload API: ✅ MP4 direct (${best.name}) → ${best.url.slice(0, 120)}`);
+          return {
+            directUrl: best.url,
+            type: 'mp4',
+            referer: 'https://uqload.is/',
+          };
+        }
+      }
+
+      console.log(`${TAG} Uqload API: ❌ aucune version ${preferHls ? 'HLS' : 'MP4'} disponible (code ${targetCode})`);
+    } catch (err: any) {
+      console.log(`${TAG} Uqload API: ERREUR ${err.message}`);
     }
-
-    const result = data.result as UqloadDirectLinkResult;
-
-    // Préférer HLS pour le streaming, MP4 pour le download
-    if (preferHls && result.hls_direct) {
-      console.log(`${TAG} Uqload API: ✅ HLS direct → ${result.hls_direct.slice(0, 120)}`);
-      return {
-        directUrl: result.hls_direct,
-        type: 'hls',
-        referer: 'https://uqload.is/',
-      };
-    }
-
-    // Fallback to highest quality .mp4 (ou seul .mp4 si download)
-    const versions = result.versions || [];
-    const qualityOrder: Record<string, number> = { n: 4, h: 3, l: 2, o: 1 };
-    const sorted = [...versions].sort((a, b) => (qualityOrder[a.name] || 0) - (qualityOrder[b.name] || 0));
-    if (sorted.length > 0) {
-      const best = sorted[0];
-      console.log(`${TAG} Uqload API: ✅ MP4 direct (${best.name}) → ${best.url.slice(0, 120)}`);
-      return {
-        directUrl: best.url,
-        type: 'mp4',
-        referer: 'https://uqload.is/',
-      };
-    }
-
-    // HLS uniquement si pas de MP4 mais HLS disponible (download path)
-    if (!preferHls && result.hls_direct) {
-      console.log(`${TAG} Uqload API: ✅ HLS direct (fallback, pas de MP4) → ${result.hls_direct.slice(0, 120)}`);
-      return {
-        directUrl: result.hls_direct,
-        type: 'hls',
-        referer: 'https://uqload.is/',
-      };
-    }
-
-    console.log(`${TAG} Uqload API: ❌ aucune version disponible`);
-    return null;
-  } catch (err: any) {
-    console.log(`${TAG} Uqload API: ERREUR ${err.message}`);
-    return null;
   }
+
+  return null;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -408,6 +449,84 @@ export async function scrapeDirectStream(embedUrl: string, preferHls = false): P
     return scrapeUqloadEmbed(embedUrl, preferHls);
   }
   console.log(`${TAG} → URL non scrapable (ni Doodstream ni Uqload)`);
+  return null;
+}
+
+/**
+ * Scrape directement la page embed Uqload à partir du fileCode,
+ * **en bypassant l'API Uqload** (Strategy 0 de scrapeUqloadEmbed).
+ *
+ * Pourquoi : depuis le 5-6 août 2026, le CDN Uqload a durci son anti-leech.
+ * L'API `direct_link?hls=1` renvoie un `hls_direct` dont le paramètre `v`
+ * est vide ou expiré → 403 CDN. En revanche la page embed génère une URL HLS
+ * signée via le JavaScript P.A.C.K.E.R. obfusqué (avec `v` rempli) → 200 OK.
+ *
+ * Retourne le lien HLS (master.m3u8) si trouvé, null sinon.
+ */
+export async function scrapeUqloadEmbedDirect(fileCode: string): Promise<DirectStreamResult | null> {
+  const embedPageUrl = `https://uqload.is/embed-${fileCode}.html`;
+  console.log(`${TAG} scrapeUqloadEmbedDirect: code=${fileCode}, fetch de ${embedPageUrl}`);
+
+  try {
+    const t0 = Date.now();
+    const { data: html, status } = await axios.get(embedPageUrl, {
+      timeout: 15000,
+      httpsAgent: ipv4Agent,
+      headers: { 'User-Agent': UA, Referer: 'https://uqload.is/' },
+    });
+    console.log(`${TAG} scrapeUqloadEmbedDirect: page reçue en ${Date.now() - t0}ms (status=${status}, length=${html.length})`);
+
+    // Priority 1: P.A.C.K.E.R. obfuscated JS — contient les URLs HLS signées
+    console.log(`${TAG} scrapeUqloadEmbedDirect: S1 — décodage P.A.C.K.E.R...`);
+    const decoded = decodePacker(html);
+    if (decoded) {
+      // Cherche d'abord les .m3u8 (HLS) dans le PACKER
+      const hlsUrls = decoded.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/gi) || [];
+      for (const raw of hlsUrls) {
+        const urlMatch = raw.match(/(https?:\/\/[^\s"'<>]+)/i);
+        if (urlMatch) {
+          console.log(`${TAG} scrapeUqloadEmbedDirect: S1 ✅ HLS trouvé dans P.A.C.K.E.R. → ${urlMatch[1].slice(0, 150)}`);
+          return { directUrl: urlMatch[1], type: 'hls', referer: embedPageUrl };
+        }
+      }
+      // Fallback : MP4 dans le PACKER
+      const mp4Urls = decoded.match(/(?:file|src)\s*[:=]\s*["']?(https?:\/\/[^\s"'<>]+\.mp4[^\s"'<>]*)/gi) || [];
+      for (const raw of mp4Urls) {
+        const urlMatch = raw.match(/(https?:\/\/[^\s"'<>]+)/i);
+        if (urlMatch) {
+          console.log(`${TAG} scrapeUqloadEmbedDirect: S1 MP4 trouvé dans P.A.C.K.E.R. → ${urlMatch[1].slice(0, 150)}`);
+          return { directUrl: urlMatch[1], type: 'mp4', referer: embedPageUrl };
+        }
+      }
+      console.log(`${TAG} scrapeUqloadEmbedDirect: S1 ❌ P.A.C.K.E.R. décodé mais pas d'URL HLS/MP4 vidéo`);
+    } else {
+      console.log(`${TAG} scrapeUqloadEmbedDirect: S1 ❌ pas de bloc P.A.C.K.E.R.`);
+    }
+
+    // Priority 2: .m3u8 directement dans le HTML brut
+    console.log(`${TAG} scrapeUqloadEmbedDirect: S2 — recherche regex .m3u8 dans le HTML...`);
+    const anyHls = html.match(/(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/i);
+    if (anyHls) {
+      console.log(`${TAG} scrapeUqloadEmbedDirect: S2 ✅ HLS trouvé → ${anyHls[1].slice(0, 150)}`);
+      return { directUrl: anyHls[1], type: 'hls', referer: embedPageUrl };
+    }
+    console.log(`${TAG} scrapeUqloadEmbedDirect: S2 ❌ pas de .m3u8`);
+
+    // Priority 3: balise <source> ou file: dans JS (MP4 fallback)
+    console.log(`${TAG} scrapeUqloadEmbedDirect: S3 — balise <source> / file: ...`);
+    const sourceMatch = html.match(/<source[^>]+src\s*=\s*["']([^"']+\.mp4[^"']*)/i)
+      || html.match(/file\s*:\s*["'](https?:\/\/[^"']+\.mp4[^"']*)/i);
+    if (sourceMatch) {
+      console.log(`${TAG} scrapeUqloadEmbedDirect: S3 ✅ MP4 trouvé → ${sourceMatch[1].slice(0, 150)}`);
+      return { directUrl: sourceMatch[1], type: 'mp4', referer: embedPageUrl };
+    }
+    console.log(`${TAG} scrapeUqloadEmbedDirect: S3 ❌ pas trouvé`);
+
+    console.log(`${TAG} scrapeUqloadEmbedDirect: ⚠ Aucune strategie n'a fonctionné. HTML[0..500]:\n${html.slice(0, 500)}`);
+  } catch (err: any) {
+    console.error(`${TAG} scrapeUqloadEmbedDirect: ERREUR code=${fileCode}: ${err.message}`);
+  }
+
   return null;
 }
 
