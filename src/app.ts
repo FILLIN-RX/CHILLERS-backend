@@ -1,5 +1,6 @@
 import express from 'express';
 import helmet from 'helmet';
+import cors from 'cors';
 import dotenv from 'dotenv';
 import { errorMiddleware } from './middleware/error.middleware';
 import { clearCache } from './config/tmdb';
@@ -8,18 +9,23 @@ import tvRoutes from './modules/tv/tv.routes';
 import searchRoutes from './modules/search/search.routes';
 import genresRoutes from './modules/genres/genres.routes';
 import streamingRoutes from './streaming/streaming.routes';
+import nexstreamRoutes from './streaming/nexstream.routes';
 import downloadRoutes from './modules/download/download.routes';
 import doodstreamRoutes from './modules/doodstream/doodstream.routes';
 import otakuRoutes from './modules/otaku/otaku.routes';
 import adminRoutes from './modules/admin/admin.routes';
 import availabilityRoutes from './modules/availability/availability.routes';
 import affichesRoutes from './modules/affiches/affiches.routes';
+import liveRoutes from './modules/live/live.routes';
+import subtitlesRoutes from './modules/subtitles/subtitles.routes';
+import torrentsRoutes from './streaming/torrents/torrents.routes';
 
 import path from 'path';
 dotenv.config({ path: path.join(__dirname, '../.env') });
 
 const app = express();
 
+app.use(cors());
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -52,12 +58,16 @@ app.use('/api/tv', tvRoutes);
 app.use('/api/search', searchRoutes);
 app.use('/api/genres', genresRoutes);
 app.use('/api/stream', streamingRoutes);
+app.use('/api/nexstream', nexstreamRoutes);
 app.use('/api/download', downloadRoutes);
 app.use('/api/doodstream', doodstreamRoutes);
 app.use('/api/otaku', otakuRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/availability', availabilityRoutes);
 app.use('/api/affiches', affichesRoutes);
+app.use('/api/live', liveRoutes);
+app.use('/api/subtitles', subtitlesRoutes);
+app.use('/api/torrents', torrentsRoutes);
 
 app.use((_req, res) => {
   res.status(404).json({
