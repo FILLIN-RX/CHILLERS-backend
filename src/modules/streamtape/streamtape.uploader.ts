@@ -49,31 +49,35 @@ export async function uploadToStreamtape(
   }
 
   try {
-    console.log(`[StreamtapeUpload] Starting remote upload: "${title}"`);
+    console.log(`[StreamtapeUpload] Lancement remote upload async: "${title}"`);
     const result = await client.addRemoteUpload(directUrl, undefined, title);
-    const remoteId = (result as any).id;
+    const remoteId = (result as any)?.id || (result as any)?.extid;
     if (!remoteId) {
-      console.log(`[StreamtapeUpload] No remote id returned for "${title}"`);
+      console.log(`[StreamtapeUpload] Pas de remote id retourné pour "${title}"`);
       return null;
     }
 
-    const extid = await pollRemoteUpload(client, remoteId);
-    if (!extid) return null;
+    const embedUrl = `https://streamtape.com/e/${remoteId}`;
+    const directLink = `https://streamtape.com/v/${remoteId}/${encodeURIComponent(title)}`;
 
-    const embedUrl = `https://streamtape.com/e/${extid}`;
-    const directLink = `https://streamtape.com/v/${extid}/${encodeURIComponent(title)}`;
-
-    console.log(`[StreamtapeUpload] ✅ "${title}" → embed=${embedUrl}`);
-    return { linkId: extid, embedUrl, directLink };
+    console.log(`[StreamtapeUpload] ✅ "${title}" (async) → id=${remoteId}`);
+    return { linkId: remoteId, embedUrl, directLink };
   } catch (e: any) {
-    console.log(`[StreamtapeUpload] Upload failed for "${title}": ${e.message}`);
+    console.log(`[StreamtapeUpload] Erreur upload "${title}": ${e.message}`);
     return null;
   }
 }
 
+let cachedUqloadFull: { result: boolean; timestamp: number } | null = null;
+
 export async function isUqloadFull(): Promise<boolean> {
   const apiKey = process.env.UQLOAD_API_KEY;
   if (!apiKey) return false;
+
+  const now = Date.now();
+  if (cachedUqloadFull && now - cachedUqloadFull.timestamp < 5 * 60 * 1000) {
+    return cachedUqloadFull.result;
+  }
 
   try {
     const { UqloadClient } = await import('../uqload/uqload.client');
@@ -82,10 +86,12 @@ export async function isUqloadFull(): Promise<boolean> {
     const usedBytes = parseInt((res.result as any).storage_used, 10);
     const left = (res.result as any).storage_left;
     const usedGB = usedBytes / (1024 * 1024 * 1024);
-    console.log(`[Uqload] Storage: ${usedBytes} bytes (${usedGB.toFixed(2)}GB) used, ${left}GB left`);
-    return usedGB >= 3000 || left <= 0;
+    const isFull = usedGB >= 3000 || (left !== undefined && left <= 0);
+    console.log(`[Uqload] Quota vérifié : ${usedGB.toFixed(2)}GB utilisés (Plein: ${isFull ? 'OUI' : 'NON'})`);
+    cachedUqloadFull = { result: isFull, timestamp: now };
+    return isFull;
   } catch (e: any) {
-    console.log(`[Uqload] Storage check failed: ${e.message}`);
+    console.log(`[Uqload] Erreur vérification quota: ${e.message}`);
     return false;
   }
 }

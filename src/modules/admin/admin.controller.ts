@@ -1,4 +1,5 @@
 import { Response } from 'express';
+import mongoose from 'mongoose';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import axios from 'axios';
@@ -18,7 +19,7 @@ import { uploadMoviesBatch, uploadSeriesBatch, uploadSingleMovie, uploadSingleEp
 import { autoLink } from '../../scraping/maintenance/auto-link';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'chiller-admin-secret-change-me';
-const SCRAPER_API_URL = process.env.SCRAPER_API_URL;
+const SCRAPER_API_URL = process.env.SCRAPER_API_URL || 'http://localhost:4001';
 
 async function scraperProxy(req: AuthRequest, res: Response, endpoint: string, method: 'get' | 'post' = 'post') {
   if (!SCRAPER_API_URL) {
@@ -887,59 +888,262 @@ export async function uqloadPendingBoth(_req: AuthRequest, res: Response) {
     }
 }
 
+export async function uqloadFiles(req: AuthRequest, res: Response) {
+    try {
+        const type   = (req.query.type   as string) || 'all';
+        const page   = Math.max(1, parseInt((req.query.page  as string) || '1', 10));
+        const limit  = Math.min(200, Math.max(1, parseInt((req.query.limit as string) || '50', 10)));
+        const search = (req.query.search as string) || '';
+        const skip   = (page - 1) * limit;
+
+        const results: any = {};
+
+        if (type === 'movies' || type === 'all') {
+            const movieFilter: any = {
+                $or: [
+                    { uqloadCode: { $exists: true, $ne: '' } },
+                    { uqloadLink: { $exists: true, $ne: '' } },
+                ],
+            };
+            if (search) movieFilter.titre = { $regex: search, $options: 'i' };
+
+            const [movies, totalMovies] = await Promise.all([
+                Movie.find(movieFilter)
+                    .select('titre tmdbId uqloadCode uqloadLink uqloadQualities uqloadHls streamtapeCode streamtapeLink uploadedAt year posterUrl')
+                    .sort({ uploadedAt: -1, createdAt: -1 })
+                    .skip(type === 'all' ? 0 : skip)
+                    .limit(type === 'all' ? Math.floor(limit / 2) : limit)
+                    .lean(),
+                Movie.countDocuments(movieFilter),
+            ]);
+
+            results.movies = {
+                total: totalMovies,
+                items: movies.map((m: any) => ({
+                    id: m._id,
+                    titre: m.titre,
+                    tmdbId: m.tmdbId,
+                    year: m.year,
+                    posterUrl: m.posterUrl,
+                    uqload: {
+                        code:      m.uqloadCode     || null,
+                        link:      m.uqloadLink     || null,
+                        hls:       m.uqloadHls      || null,
+                        qualities: m.uqloadQualities || [],
+                    },
+                    streamtape: {
+                        code: m.streamtapeCode || null,
+                        link: m.streamtapeLink || null,
+                    },
+                    uploadedAt: m.uploadedAt || null,
+                })),
+            };
+        }
+
+        if (type === 'series' || type === 'all') {
+            const serieFilter: any = {
+                'episodes.uqloadCode': { $exists: true, $ne: '' },
+            };
+            if (search) serieFilter.titre = { $regex: search, $options: 'i' };
+
+            const [series, totalSeries] = await Promise.all([
+                Serie.find(serieFilter)
+                    .select('titre tmdbId year posterUrl episodes')
+                    .sort({ updatedAt: -1 })
+                    .skip(type === 'all' ? 0 : skip)
+                    .limit(type === 'all' ? Math.floor(limit / 2) : limit)
+                    .lean(),
+                Serie.countDocuments(serieFilter),
+            ]);
+
+            results.series = {
+                total: totalSeries,
+                items: series.map((s: any) => ({
+                    id: s._id,
+                    titre: s.titre,
+                    tmdbId: s.tmdbId,
+                    year: s.year,
+                    posterUrl: s.posterUrl,
+                    episodes: (s.episodes || [])
+                        .filter((e: any) => e.uqloadCode || e.uqloadLink)
+                        .map((e: any) => ({
+                            label:         e.episode,
+                            season:        e.season,
+                            episodeNumber: e.episodeNumber,
+                            uqload: {
+                                code: e.uqloadCode  || null,
+                                link: e.uqloadLink  || null,
+                            },
+                            streamtape: {
+                                code: e.streamtapeCode || null,
+                                link: e.streamtapeLink || null,
+                            },
+                            uploadedAt: e.uploadedAt || null,
+                        })),
+                })),
+            };
+        }
+
+        res.json({ success: true, data: { page, limit, ...results }, message: null });
+    } catch (e: any) {
+        res.status(500).json({ success: false, data: null, message: e.message });
+    }
+}
+
+export async function uqloadFileInfo(req: AuthRequest, res: Response) {
+    const apiKey = process.env.UQLOAD_API_KEY;
+    if (!apiKey) {
+        res.status(400).json({ success: false, data: null, message: 'UQLOAD_API_KEY non configurée' });
+        return;
+    }
+    try {
+        const client = new UqloadClient(apiKey);
+        const code = req.params.code as string;
+        const info = await client.getFileInfo(code);
+        if (!info.result || info.result.length === 0) {
+            res.status(404).json({ success: false, data: null, message: 'Fichier introuvable sur Uqload' });
+            return;
+        }
+        const f = info.result[0];
+        res.json({
+            success: true,
+            data: {
+                code:      f.file_code,
+                title:     f.file_title,
+                views:     parseInt(f.file_views, 10) || 0,
+                duration:  f.file_length,
+                createdAt: f.file_created,
+                public:    f.file_public === '1',
+                canPlay:   f.canplay === 1,
+                status:    f.status,
+                thumbnail: f.player_img,
+                tags:      f.tags || null,
+                embedUrl:  `https://uqload.is/embed-${f.file_code}.html`,
+            },
+            message: null,
+        });
+    } catch (e: any) {
+        res.status(500).json({ success: false, data: null, message: e.message });
+    }
+}
+
 function resolveScrapperPath(req: AuthRequest): string {
-    const p = req.params.path;
+    const p = (req.params as any)?.path || (req.params as any)?.[0] || (req.params as any)?.['*'];
     if (Array.isArray(p)) return '/' + p.join('/');
-    if (p) return '/' + p;
+    if (typeof p === 'string' && p.length > 0) return p.startsWith('/') ? p : '/' + p;
+    const url = req.originalUrl || req.url || '';
+    const match = url.match(/\/admin\/scrapper(\/[^?]*)/);
+    if (match && match[1]) return match[1];
     return '';
 }
 
 export async function scrapperProxyGet(req: AuthRequest, res: Response) {
-    if (!SCRAPER_API_URL) {
-        res.status(502).json({ success: false, data: null, message: 'SCRAPER_API_URL non configuré' });
-        return;
-    }
     const endpoint = resolveScrapperPath(req);
     try {
-        const token = req.headers.authorization?.startsWith('Bearer ')
-            ? req.headers.authorization.split(' ')[1]
-            : req.query.token;
-        const response = await axios({
-            method: 'get',
-            url: `${SCRAPER_API_URL}/api${endpoint}`,
-            params: { ...req.query, token },
-            headers: { 'Content-Type': 'application/json' },
-            timeout: 10000,
-        });
-        res.json(response.data);
+        if (endpoint === '/health' || endpoint === '/health/') {
+            return res.json({
+                success: true,
+                data: {
+                    status: 'ok',
+                    uptime: process.uptime(),
+                    db: mongoose.connection.readyState === 1 ? 'connected' : 'disconnected',
+                },
+                message: null,
+            });
+        }
+        if (endpoint === '/settings' || endpoint === '/settings/') {
+            return res.json({
+                success: true,
+                data: {
+                    port: process.env.PORT || '4000',
+                    mongoUri: process.env.MONGODB_URI ? 'configuré' : 'non configuré',
+                    tmdbToken: process.env.TMDB_ACCESS_TOKEN ? 'configuré' : 'non configuré',
+                    cronRunning: getCronStatus().running,
+                },
+                message: null,
+            });
+        }
+        if (endpoint === '/tasks/running' || endpoint === '/tasks/running/') {
+            return res.json({ success: true, data: getRunningTasks(), message: null });
+        }
+        if (endpoint === '/cron/status' || endpoint === '/cron/status/') {
+            return res.json({ success: true, data: getCronStatus(), message: null });
+        }
+        if (endpoint === '/scraper-state' || endpoint === '/scraper-state/') {
+            const ScraperState = (await import('../../models/ScraperState')).default;
+            const films = await ScraperState.findOne({ name: 'films' });
+            const series = await ScraperState.findOne({ name: 'series' });
+            return res.json({
+                success: true,
+                data: {
+                    films: films ? { lastPage: films.lastPage, updatedAt: films.updatedAt } : null,
+                    series: series ? { lastPage: series.lastPage, updatedAt: series.updatedAt } : null,
+                },
+                message: null,
+            });
+        }
+        if (endpoint === '/logs' || endpoint === '/logs/') {
+            const lines = parseInt((req.query.lines as string) || '200', 10);
+            const { getLogs } = await import('../../config/log-buffer');
+            return res.json({ success: true, data: getLogs(lines), message: null });
+        }
+        if (endpoint === '/logs/stream' || endpoint === '/logs/stream/') {
+            const { addSSEClient } = await import('../../config/log-buffer');
+            res.writeHead(200, {
+                'Content-Type': 'text/event-stream',
+                'Cache-Control': 'no-cache',
+                'Connection': 'keep-alive',
+            });
+            res.write('\n');
+            return addSSEClient(res);
+        }
+
+        res.status(404).json({ success: false, data: null, message: `Route interne scrapper inconnue: ${endpoint}` });
     } catch (e: any) {
-        console.error(`[ScraperProxy] GET ${endpoint}: ${e.message}`);
-        res.status(502).json({ success: false, data: null, message: `Scraper injoignable: ${e.message}` });
+        console.error(`[ScraperInternal] GET ${endpoint}: ${e.message}`);
+        res.status(500).json({ success: false, data: null, message: e.message });
     }
 }
 
 export async function scrapperProxyPost(req: AuthRequest, res: Response) {
-    if (!SCRAPER_API_URL) {
-        res.status(502).json({ success: false, data: null, message: 'SCRAPER_API_URL non configuré' });
-        return;
-    }
     const endpoint = resolveScrapperPath(req);
     try {
-        const token = req.headers.authorization?.startsWith('Bearer ')
-            ? req.headers.authorization.split(' ')[1]
-            : req.query.token;
-        const response = await axios({
-            method: 'post',
-            url: `${SCRAPER_API_URL}/api${endpoint}`,
-            data: req.body,
-            params: { token },
-            headers: { 'Content-Type': 'application/json' },
-            timeout: 10000,
-        });
-        res.json(response.data);
+        if (endpoint === '/cron/start' || endpoint === '/cron/start/') {
+            startCron();
+            return res.json({ success: true, data: getCronStatus(), message: 'Cron démarré' });
+        }
+        if (endpoint === '/cron/stop' || endpoint === '/cron/stop/') {
+            await stopCron();
+            return res.json({ success: true, data: getCronStatus(), message: 'Cron arrêté' });
+        }
+        if (endpoint === '/scrape/trigger' || endpoint === '/scrape/trigger/') {
+            const type = (req.body?.type as string) || 'all';
+            if (type === 'films' || type === 'all') {
+                runner('Scraping Films', 'scraping/core/scrape-films.js');
+            }
+            if (type === 'series' || type === 'all') {
+                runner('Scraping Séries', 'scraping/core/scrape-series.ts');
+            }
+            if (type === 'animes' || type === 'all') {
+                runner('Scraping Animes', 'scraping/core/scrape-animes.ts');
+            }
+            return res.json({ success: true, data: { status: 'launched', message: `Scraping ${type} interne lancé` }, message: null });
+        }
+        if (endpoint === '/maintenance/run' || endpoint === '/maintenance/run/') {
+            const type = (req.body?.type as string) || 'all';
+            runMaintenanceTasks();
+            return res.json({ success: true, data: { status: 'launched', message: `Maintenance ${type} interne lancée` }, message: null });
+        }
+        if (endpoint.startsWith('/tasks/stop/')) {
+            const name = decodeURIComponent(endpoint.replace('/tasks/stop/', ''));
+            const killed = await stopTask(name);
+            return res.json({ success: true, data: { killed, name }, message: killed ? `Tâche ${name} arrêtée` : `Aucune tâche en cours: ${name}` });
+        }
+
+        res.status(404).json({ success: false, data: null, message: `Route interne scrapper inconnue: ${endpoint}` });
     } catch (e: any) {
-        console.error(`[ScraperProxy] POST ${endpoint}: ${e.message}`);
-        res.status(502).json({ success: false, data: null, message: `Scraper injoignable: ${e.message}` });
+        console.error(`[ScraperInternal] POST ${endpoint}: ${e.message}`);
+        res.status(500).json({ success: false, data: null, message: e.message });
     }
 }
 

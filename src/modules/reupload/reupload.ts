@@ -1,6 +1,5 @@
 import axios from 'axios';
 import { UqloadClient } from '../uqload/uqload.client';
-import { createBackup } from '../../scraping/core/backup';
 import { uploadToStreamtape, isUqloadFull } from '../streamtape/streamtape.uploader';
 import Serie, { type IEpisode } from '../../models/Serie';
 import Movie from '../../models/Movie';
@@ -27,22 +26,17 @@ function getUqloadClient(): UqloadClient | null {
 
 async function uploadToDoodstream(directUrl: string, title: string): Promise<string | null> {
     const apiKey = process.env.DOODSTREAM_API_KEY;
-    if (!apiKey) {
-        console.log('[Reupload] DOODSTREAM_API_KEY manquant — skip Doodstream');
-        return null;
-    }
+    if (!apiKey) return null;
     try {
         const { data } = await axios.get(`${DOOD_BASE_URL}/upload/url`, {
             params: { key: apiKey, url: directUrl, new_title: title },
-            timeout: 30000,
+            timeout: 15000,
         });
         if (data?.status !== 200 || !data?.result?.filecode) {
-            console.log(`[Reupload] Doodstream payload inattendu: ${JSON.stringify(data).slice(0, 200)}`);
             return null;
         }
         return data.result.filecode;
-    } catch (e: any) {
-        console.log(`[Reupload] Doodstream upload échoué pour "${title}": ${e.message}`);
+    } catch {
         return null;
     }
 }
@@ -66,8 +60,6 @@ export async function reuploadEpisode(
         if (fileCode) {
             result.fileCode = fileCode;
             result.uploadedDoodstream = true;
-        } else {
-            result.errors.push('Doodstream upload failed');
         }
     } else {
         result.fileCode = episode.fileCode;
@@ -77,7 +69,7 @@ export async function reuploadEpisode(
     const uqloadFull = uqload ? await isUqloadFull() : false;
 
     if (uqloadFull) {
-        console.log('[Reupload] Uqload storage full (>=3000GB) — fallback vers Streamtape');
+        console.log(`[Reupload] Uqload saturé (>=3000GB) — Fallback Streamtape direct pour "${uploadTitle}"`);
         if (!episode.streamtapeCode) {
             const st = await uploadToStreamtape(episode.lien, uploadTitle);
             if (st) {
@@ -93,29 +85,41 @@ export async function reuploadEpisode(
         }
     } else if (!episode.uqloadCode && uqload) {
         try {
-            const { fileCode: uqCode, directLink } = await uqload.uploadByUrlAndGetLink(
-                episode.lien,
-                uploadTitle,
-            );
-            result.uqloadCode = uqCode;
-            result.uploadedUqload = true;
-            const versions = (directLink as any)?.versions as Array<{ url: string; name: string }> | undefined;
-            const best = versions?.find((v) => v.name === "n") ?? versions?.[0];
-            if (best?.url) {
-                result.uqloadLink = best.url;
-            } else if ((directLink as any)?.hls_direct) {
-                result.uqloadLink = (directLink as any).hls_direct;
+            // Upload Uqload ultra-rapide (200ms) sans bloquer 90s
+            const uqCode = await uqload.uploadByUrl(episode.lien, uploadTitle);
+            if (uqCode) {
+                result.uqloadCode = uqCode;
+                result.uqloadLink = `https://uqload.is/embed-${uqCode}.html`;
+                result.uploadedUqload = true;
+                console.log(`    -> ✅ Uqload (async) : ${uploadTitle} → ${uqCode}`);
             }
         } catch (e: any) {
-            result.errors.push(`Uqload upload failed: ${e.message}`);
-            console.log(`[Reupload] Uqload upload échoué: ${e.message}`);
+            console.log(`[Reupload] Uqload rate limit ou erreur (${e.message}) ➔ Fallback Streamtape...`);
+            result.errors.push(`Uqload failed: ${e.message}`);
+            try {
+                const st = await uploadToStreamtape(episode.lien, uploadTitle);
+                if (st) {
+                    result.streamtapeCode = st.linkId;
+                    result.streamtapeLink = st.embedUrl;
+                    result.uploadedStreamtape = true;
+                    console.log(`    -> ✅ Streamtape (fallback) : ${uploadTitle} → ${st.linkId}`);
+                }
+            } catch (stErr: any) {
+                result.errors.push(`Streamtape failed: ${stErr.message}`);
+            }
         }
     } else if (episode.uqloadCode) {
         result.uqloadCode = episode.uqloadCode;
         result.uqloadLink = episode.uqloadLink;
     } else if (!uqload) {
-        console.log('[Reupload] UQLOAD_API_KEY manquant — skip Uqload');
-        result.errors.push('UQLOAD_API_KEY missing');
+        if (!episode.streamtapeCode) {
+            const st = await uploadToStreamtape(episode.lien, uploadTitle);
+            if (st) {
+                result.streamtapeCode = st.linkId;
+                result.streamtapeLink = st.embedUrl;
+                result.uploadedStreamtape = true;
+            }
+        }
     }
 
     const $set: Record<string, any> = {};
@@ -164,12 +168,11 @@ export async function reuploadMovie(
     };
 
     const uploadTitle = `${titre} - ${lien.slice(-40)}`;
-
     const uqload = getUqloadClient();
     const uqloadFull = uqload ? await isUqloadFull() : false;
 
     if (uqloadFull) {
-        console.log(`[Reupload] Uqload full — Streamtape pour film "${titre}"`);
+        console.log(`[Reupload] Uqload saturé — Streamtape direct pour film "${titre}"`);
         const st = await uploadToStreamtape(lien, uploadTitle);
         if (st) {
             result.streamtapeCode = st.linkId;
@@ -184,26 +187,33 @@ export async function reuploadMovie(
         }
     } else if (uqload) {
         try {
-            const { fileCode: uqCode, directLink } = await uqload.uploadByUrlAndGetLink(lien, uploadTitle);
-            result.uqloadCode = uqCode;
-            result.uploadedUqload = true;
-            const versions = (directLink as any)?.versions as Array<{ url: string; name: string }> | undefined;
-            const best = versions?.find((v) => v.name === "n") ?? versions?.[0];
-            if (best?.url) {
-                result.uqloadLink = best.url;
-            } else if ((directLink as any)?.hls_direct) {
-                result.uqloadLink = (directLink as any).hls_direct;
+            const uqCode = await uqload.uploadByUrl(lien, uploadTitle);
+            if (uqCode) {
+                result.uqloadCode = uqCode;
+                result.uqloadLink = `https://uqload.is/embed-${uqCode}.html`;
+                result.uploadedUqload = true;
+                console.log(`  -> ✅ Uqload (async) : ${titre} → ${uqCode}`);
+                await Movie.updateOne(
+                    { _id: movieId },
+                    { $set: { uqloadCode: uqCode, uqloadLink: result.uqloadLink } }
+                );
             }
-            await Movie.updateOne(
-                { _id: movieId },
-                { $set: { uqloadCode: uqCode, uqloadLink: result.uqloadLink } }
-            );
         } catch (e: any) {
+            console.log(`[Reupload] Uqload rate limit ou erreur (${e.message}) ➔ Fallback Streamtape pour film "${titre}"...`);
             result.errors.push(`Uqload upload failed: ${e.message}`);
+            const st = await uploadToStreamtape(lien, uploadTitle);
+            if (st) {
+                result.streamtapeCode = st.linkId;
+                result.streamtapeLink = st.embedUrl;
+                result.uploadedStreamtape = true;
+                console.log(`  -> ✅ Streamtape (fallback) : ${titre} → ${st.linkId}`);
+                await Movie.updateOne(
+                    { _id: movieId },
+                    { $set: { streamtapeCode: st.linkId, streamtapeLink: st.embedUrl } }
+                );
+            }
         }
     }
 
     return result;
 }
-
-export { createBackup };

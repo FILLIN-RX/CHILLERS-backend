@@ -19,6 +19,9 @@ import affichesRoutes from './modules/affiches/affiches.routes';
 import liveRoutes from './modules/live/live.routes';
 import subtitlesRoutes from './modules/subtitles/subtitles.routes';
 import torrentsRoutes from './streaming/torrents/torrents.routes';
+import aiRoutes from './modules/ai/ai.routes';
+
+import compression from 'compression';
 
 import path from 'path';
 dotenv.config({ path: path.join(__dirname, '../.env') });
@@ -26,6 +29,19 @@ dotenv.config({ path: path.join(__dirname, '../.env') });
 const app = express();
 
 app.use(cors());
+app.use(compression({
+  filter: (req, res) => {
+    if (req.headers['x-no-compression']) {
+      return false;
+    }
+    const contentType = res.getHeader('Content-Type');
+    if (typeof contentType === 'string' && (contentType.includes('video/') || contentType.includes('application/octet-stream'))) {
+      return false;
+    }
+    return compression.filter(req, res);
+  },
+  threshold: 512, // Compress payloads larger than 512 bytes
+}));
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
@@ -38,7 +54,7 @@ app.use(helmet({
     },
   },
 }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 
 // Fichiers uploadés manuellement par l'admin (uploads/ en mémoire) - servis
 // publiquement pour permettre l'upload Uqload via URL
@@ -63,6 +79,7 @@ app.use('/api/download', downloadRoutes);
 app.use('/api/doodstream', doodstreamRoutes);
 app.use('/api/otaku', otakuRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/admin/ai', aiRoutes);
 app.use('/api/availability', availabilityRoutes);
 app.use('/api/affiches', affichesRoutes);
 app.use('/api/live', liveRoutes);

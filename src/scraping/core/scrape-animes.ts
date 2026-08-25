@@ -1,11 +1,25 @@
-import { chromium } from 'playwright';
+import axios from 'axios';
 import mongoose from 'mongoose';
+import Movie from '../../models/Movie';
 import Serie from '../../models/Serie';
 import ScraperState from '../../models/ScraperState';
-import { browserConfig } from '../../config/browser';
 import { connectDB } from '../../config/db';
-import { uploadToStreamtape } from '../../modules/streamtape/streamtape.uploader';
+import { reuploadEpisode } from '../../modules/reupload/reupload';
+import { reuploadMovie } from '../../modules/reupload/reupload';
 import { autoLink } from '../maintenance/auto-link';
+
+const BASE_URL = 'https://www.open-otaku.me';
+
+interface AnimeCategory { text: string; href: string; }
+interface AnimeItem {
+    newsId: string;
+    title: string;
+    poster: string;
+    version: string;
+    episodes: string;
+    type: string;
+    url: string;
+}
 
 function parseEpisodeLabel(label: string, defaultSeason = 1): { season: number; episodeNumber: number; canonical: string } {
     const trimmed = label.trim();
@@ -23,174 +37,281 @@ function parseEpisodeLabel(label: string, defaultSeason = 1): { season: number; 
     return { season: defaultSeason, episodeNumber: 0, canonical: trimmed };
 }
 
-async function loadState(): Promise<{ lastPage: number }> {
+/**
+ * Même transformation que le site (getDownloadUrl dans app.js) :
+ * vidzy : /embed-xxx.html → /d/xxx_n.html
+ * luluvid : /embed-xxx.html → /d/xxx
+ */
+function toDownloadUrl(url: string): string {
+    if (!url) return '';
+    if (url.includes('vidzy.')) return url.replace('/embed-', '/d/').replace('.html', '_n.html');
+    if (url.includes('luluvid.')) return url.replace('/embed-', '/d/').replace('.html', '');
+    return url;
+}
+
+async function getDirectLink(embedUrl: string): Promise<string | null> {
+    const dlUrl = toDownloadUrl(embedUrl);
+    const { data } = await axios.get(`${BASE_URL}/api/dl`, { params: { url: dlUrl }, timeout: 60000 });
+    if (data && data.success && data.downloadUrl) return data.downloadUrl;
+    return null;
+}
+
+/**
+ * Détecte si l'anime est un film ou une série.
+ * Le champ `status` de /api/anime est la source fiable : "Film" → film,
+ * "En cours" / "Terminé" → série. Le champ `episodes` de la liste du
+ * dropdown ("1 / 1" → film) sert de pré-détection quand l'API détail n'est
+ * pas dispo.
+ */
+function detectKind(item: AnimeItem, meta?: { status?: string }): 'movie' | 'series' {
+    if (meta && meta.status) {
+        if (meta.status.toLowerCase() === 'film') return 'movie';
+        return 'series';
+    }
+    const eps = (item.episodes || '').trim();
+    if (item.type === 'film' || item.type === 'movie') return 'movie';
+    if (eps === '1 / 1' || eps === '1') return 'movie';
+    return 'series';
+}
+
+async function fetchCategories(): Promise<AnimeCategory[]> {
+    const { data } = await axios.get(`${BASE_URL}/api/anime-categories`, { timeout: 30000 });
+    return (data && data.categories) || [];
+}
+
+async function fetchCategoryPage(path: string, page: number): Promise<AnimeItem[]> {
+    const { data } = await axios.get(`${BASE_URL}/api/anime-category`, {
+        params: { path, page },
+        timeout: 30000,
+    });
+    return (data && data.results) || [];
+}
+
+async function fetchAnimeEpisodes(id: string): Promise<{ vf: Record<string, Record<string, string>>; vostfr: Record<string, Record<string, string>> }> {
+    const { data } = await axios.get(`${BASE_URL}/api/episodes`, { params: { id }, timeout: 30000 });
+    return { vf: (data && data.vf) || {}, vostfr: (data && data.vostfr) || {} };
+}
+
+async function fetchAnimeMeta(id: string): Promise<{ title: string; status?: string; year?: number; poster?: string; synopsis?: string }> {
+    const { data } = await axios.get(`${BASE_URL}/api/anime`, { params: { id }, timeout: 30000 });
+    return data || {};
+}
+
+async function loadState(): Promise<{ lastCatIndex: number; lastPage: number }> {
     try {
         const state = await ScraperState.findOne({ name: 'animes' });
-        return { lastPage: state?.lastPage || 1 };
+        const raw = state?.lastPage || 1;
+        return { lastCatIndex: Math.floor(raw / 10000), lastPage: raw % 10000 };
     } catch {
-        return { lastPage: 1 };
+        return { lastCatIndex: 0, lastPage: 1 };
     }
 }
 
-async function saveState(lastPage: number) {
+async function saveState(catIndex: number, page: number) {
     await ScraperState.findOneAndUpdate(
         { name: 'animes' },
-        { $set: { lastPage, updatedAt: new Date() } },
+        { $set: { lastPage: catIndex * 10000 + page, updatedAt: new Date() } },
         { upsert: true }
     );
 }
 
-async function scrapeAnimesDetails() {
-    console.log('[START] scrapeAnimesDetails() called — connecting to MongoDB...');
-    await connectDB();
-    console.log('[OK] MongoDB connected, launching Playwright...');
+async function processItem(item: AnimeItem, kind: 'movie' | 'series') {
+    const titre = item.title.trim();
+    console.log(`\n[${kind.toUpperCase()}] ${titre} (${item.newsId})`);
 
-    const browser = await chromium.launch(browserConfig);
-    console.log('[OK] Playwright browser launched');
-    const page = await browser.newPage();
+    if (kind === 'movie') {
+        const existing = await Movie.findOne({ titre });
+        if (existing && existing.pageUrl && existing.lien) {
+            console.log(`  ⏭ Film déjà traité : ${titre}`);
+            return;
+        }
+    } else {
+        const existing = await Serie.findOne({ titre });
+        if (existing && existing.pageUrl && existing.episodes && existing.episodes.length > 0) {
+            console.log(`  ⏭ Série déjà traitée : ${titre}`);
+            return;
+        }
+    }
+
+    const meta = await fetchAnimeMeta(item.newsId);
+    const resolvedKind = detectKind(item, meta);
+    if (resolvedKind !== kind) {
+        console.log(`  ↻ Reclassé : ${kind} → ${resolvedKind}`);
+        const recheck = resolvedKind === 'movie'
+            ? await Movie.findOne({ titre }).lean()
+            : await Serie.findOne({ titre }).lean();
+        if (resolvedKind === 'movie' && recheck && (recheck as any).lien) {
+            console.log(`  ⏭ Film déjà traité : ${titre}`);
+            return;
+        }
+        if (resolvedKind === 'series' && recheck && (recheck as any).episodes?.length > 0) {
+            console.log(`  ⏭ Série déjà traitée : ${titre}`);
+            return;
+        }
+    }
+    kind = resolvedKind;
+
+    const { vf, vostfr } = await fetchAnimeEpisodes(item.newsId);
+    // Priorité à la version VF, sinon VOSTFR
+    const version = Object.keys(vf).length > 0 ? vf : vostfr;
+    const epNumbers = Object.keys(version).sort((a, b) => parseInt(a, 10) - parseInt(b, 10));
+
+    if (epNumbers.length === 0) {
+        console.log(`  ⏭ Aucun épisode trouvé : ${titre}`);
+        return;
+    }
+
+    const seasonMatch = titre.match(/Saison\s*(\d+)/i);
+    const defaultSeason = seasonMatch ? parseInt(seasonMatch[1], 10) : 1;
+
+    const ficheUrl = `${BASE_URL}/index.php?newsid=${item.newsId}`;
+    const episodes: Array<{ episode: string; season: number; episodeNumber: number; lien: string }> = [];
+
+    for (const num of epNumbers) {
+        const players = version[num] || {};
+        // vidzy en priorité (l'API /api/dl accepte ses URLs transformées)
+        const embedUrl = players.vidzy || players.luluvid || Object.values(players)[0] || '';
+        if (!embedUrl) continue;
+
+        const link = await getDirectLink(embedUrl);
+        if (link) {
+            const { season, episodeNumber, canonical } = parseEpisodeLabel(`Épisode ${num}`, defaultSeason);
+            episodes.push({ episode: canonical, season, episodeNumber, lien: link });
+            console.log(`    -> ${canonical} : ${link.slice(0, 90)}...`);
+        } else {
+            console.log(`    -> ⏭ Lien introuvable pour l'épisode ${num} (${embedUrl})`);
+        }
+    }
+
+    if (episodes.length === 0) {
+        console.log(`  ⏭ Aucun lien récupéré : ${titre}`);
+        return;
+    }
+
+    const poster = meta.poster || item.poster || undefined;
+    const year = typeof meta.year === 'number' ? meta.year : undefined;
+
+    if (kind === 'movie') {
+        const saved = await Movie.findOneAndUpdate(
+            { titre },
+            {
+                $set: {
+                    titre,
+                    pageUrl: ficheUrl,
+                    lien: episodes[0].lien,
+                    year,
+                    posterUrl: poster,
+                    posterSource: poster ? 'tmdb' : undefined,
+                },
+            },
+            { upsert: true, returnDocument: 'after' }
+        );
+        console.log(`  ✅ Film enregistré : ${titre}`);
+        if (saved) {
+            await reuploadMovie(saved._id.toString(), episodes[0].lien, titre);
+            autoLink('movie', saved._id.toString());
+        }
+    } else {
+        const saved = await Serie.findOneAndUpdate(
+            { titre },
+            {
+                $set: {
+                    titre,
+                    pageUrl: ficheUrl,
+                    episodes,
+                    year,
+                    posterUrl: poster,
+                    posterSource: poster ? 'tmdb' : undefined,
+                },
+            },
+            { upsert: true, returnDocument: 'after' }
+        );
+        console.log(`  ✅ Série enregistrée (${episodes.length} ép.) : ${titre}`);
+        if (saved) {
+            for (let epIdx = 0; epIdx < episodes.length; epIdx++) {
+                const ep = episodes[epIdx];
+                if (!ep.lien || ep.lien === '#') continue;
+                await reuploadEpisode(saved._id.toString(), ep, epIdx);
+            }
+            autoLink('series', saved._id.toString());
+        }
+    }
+}
+
+async function scrapeAnimesCategories() {
+    console.log('[START] scrapeAnimesCategories() — connexion MongoDB...');
+    await connectDB();
+    console.log('[OK] MongoDB connecté.');
 
     let shuttingDown = false;
     process.on('SIGTERM', async () => {
         if (shuttingDown) return;
         shuttingDown = true;
-        console.log('\n[SIGTERM] Arrêt demandé, fermeture du navigateur...');
-        await browser.close().catch(() => {});
+        console.log('\n[SIGTERM] Arrêt demandé, déconnexion...');
         await mongoose.disconnect().catch(() => {});
         process.exit(0);
     });
 
+    console.log('Récupération des catégories du dropdown Anime...');
+    const categories = await fetchCategories();
+    if (categories.length === 0) {
+        console.log('[FATAL] Aucune catégorie récupérée.');
+        await mongoose.disconnect();
+        process.exit(1);
+    }
+    console.log(`[OK] ${categories.length} catégories dans le dropdown.`);
+
     const state = await loadState();
-    let currentPage = state.lastPage;
-    let hasMorePages = true;
+    console.log(`Reprise à la catégorie #${state.lastCatIndex} (page ${state.lastPage}).`);
 
-    while (hasMorePages && !shuttingDown) {
-        const url = `https://www.open-otaku.me/?type=animes&page=${currentPage}`;
-        console.log(`\n--- Navigation vers ${url} ---`);
+    for (let catIndex = 0; catIndex < categories.length && !shuttingDown; catIndex++) {
+        if (catIndex < state.lastCatIndex) continue;
+        const cat = categories[catIndex];
+        console.log(`\n========== Catégorie [${catIndex + 1}/${categories.length}] : ${cat.text} (${cat.href}) ==========`);
 
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
+        let pageNum = catIndex === state.lastCatIndex ? state.lastPage : 1;
+        let hasMore = true;
 
-        try {
-            await page.waitForSelector('.fs-card', { timeout: 30000 });
-        } catch (e) {
-            console.log("Fin de la liste.");
-            hasMorePages = false;
-            break;
-        }
-
-        let cards = await page.$$('.fs-card');
-        console.log(`Animes trouvés sur la page : ${cards.length}`);
-
-        for (let i = 0; i < cards.length; i++) {
+        while (hasMore && !shuttingDown) {
+            console.log(`--- ${cat.text} — page ${pageNum} ---`);
+            let items: AnimeItem[] = [];
             try {
-                let currentCards = await page.$$('.fs-card');
-                let card = currentCards[i];
-                let titre = await card.$eval('.fs-card-title', (el: any) => el.innerText.trim());
+                items = await fetchCategoryPage(cat.href, pageNum);
+            } catch (e: any) {
+                console.log(`Erreur fetch page ${pageNum} : ${e.message}`);
+                break;
+            }
 
-                const existingAnime = await Serie.findOne({ titre: titre });
-                if (existingAnime && existingAnime.pageUrl && existingAnime.episodes && existingAnime.episodes.length > 0) {
-                    console.log(`Anime déjà traité : ${titre}`);
-                    continue;
-                }
+            if (items.length === 0) {
+                console.log('Fin de la catégorie.');
+                hasMore = false;
+                break;
+            }
 
-                console.log(`Traitement de l'anime : ${titre}`);
-                await card.click();
-                await page.waitForLoadState('domcontentloaded');
-                await page.waitForTimeout(1000);
-                const pageUrl = page.url();
-
-                let animeData: any = { 
-                    titre, 
-                    pageUrl, 
-                    episodes: existingAnime ? existingAnime.episodes : [] 
-                };
-
-                if (animeData.episodes.length === 0) {
-                    console.log(`  -> Récupération des épisodes pour : ${titre}`);
-                    while (true) {
-                        await page.waitForSelector('#fs-episode-select', { state: 'attached', timeout: 10000 });
-                        let epTitre = await page.$eval('#fs-episode-select option:checked', (el: any) => el.innerText.trim());
-                        await page.click('button#fs-quick-download', { force: true });
-                        await page.waitForTimeout(10000);
-                        let dlLink = await page.$('a#fs-dl-link');
-                        let link = dlLink ? await dlLink.getAttribute('href') : "#";
-
-                        if (link && link !== "#") {
-                            const seasonMatch = titre.match(/Saison (\d+)/i);
-                            const defaultSeason = seasonMatch ? parseInt(seasonMatch[1], 10) : 1;
-                            const { season, episodeNumber, canonical } = parseEpisodeLabel(epTitre, defaultSeason);
-                            animeData.episodes.push({
-                                episode: canonical,
-                                season,
-                                episodeNumber,
-                                lien: link,
-                            });
-                        }
-                        await page.evaluate(() => {
-                            document.querySelector('#fs-donate-overlay')?.remove();
-                        });
-                        await page.click('button#fs-modal-close');
-                        await page.waitForTimeout(2000);
-                        let nextBtn = await page.$('button#fs-next-ep');
-                        if (!nextBtn || !(await nextBtn.isEnabled())) break;
-                        await nextBtn.click();
-                        await page.waitForTimeout(5000);
-                    }
-                }
-
-                const saved = await Serie.findOneAndUpdate(
-                    { titre },
-                    { $set: animeData },
-                    { upsert: true, returnDocument: 'after' }
-                );
-                console.log(`Anime enregistré dans MongoDB : ${titre}`);
-
-                if (saved) {
-                    for (let epIdx = 0; epIdx < (saved.episodes || []).length; epIdx++) {
-                        const ep = saved.episodes[epIdx];
-                        if (!ep.lien || ep.lien === "#") continue;
-                        if (ep.streamtapeCode) {
-                            console.log(`  -> ⏭ Déjà uploadé Streamtape : ${titre} - ${ep.episode}`);
-                            continue;
-                        }
-                        const label = `${titre} - ${ep.episode}`;
-                        console.log(`  -> Upload Streamtape: ${label}`);
-                        const st = await uploadToStreamtape(ep.lien, label);
-                        if (st) {
-                            await Serie.updateOne(
-                                { _id: saved._id },
-                                { $set: { [`episodes.${epIdx}.streamtapeCode`]: st.linkId, [`episodes.${epIdx}.streamtapeLink`]: st.embedUrl } }
-                            );
-                            console.log(`  -> ✅ Streamtape: ${label} → ${st.embedUrl}`);
-                        } else {
-                            console.log(`  -> ⏭ Streamtape échoué pour ${label}`);
-                        }
-                    }
-                    // Liaison TMDB en arrière-plan (fire-and-forget) — anime utilise le modèle Serie
-                    autoLink('series', saved._id.toString());
-                }
-
-                await page.goto(url, { waitUntil: 'domcontentloaded' });
-                await page.waitForSelector('.fs-card');
-            } catch (e) {
-                console.error(`Erreur sur l'anime :`, e);
+            console.log(`${items.length} animes sur la page.`);
+            for (const item of items) {
+                if (shuttingDown) break;
                 try {
-                    await page.goto(url, { waitUntil: 'domcontentloaded' });
-                    await page.waitForSelector('.fs-card');
-                } catch (recoveryErr) {
-                    console.error(`Récupération échouée :`, recoveryErr);
+                    const kind = detectKind(item);
+                    await processItem(item, kind);
+                } catch (e: any) {
+                    console.error(`Erreur sur ${item.title} : ${e.message}`);
                 }
             }
+
+            pageNum++;
+            await saveState(catIndex, pageNum);
         }
-        currentPage++;
-        await saveState(currentPage);
+
+        await saveState(catIndex + 1, 1);
     }
-    await browser.close();
+
     await mongoose.disconnect();
-    console.log("Scraping animes terminé.");
+    console.log('Scraping des animes terminé.');
 }
 
-scrapeAnimesDetails().catch((err) => {
-    console.log('[FATAL] scrapeAnimesDetails() crashed:', err?.message || err);
+scrapeAnimesCategories().catch((err) => {
+    console.log('[FATAL] scrapeAnimesCategories() crashed:', err?.message || err);
     console.error(err);
     process.exit(1);
 });

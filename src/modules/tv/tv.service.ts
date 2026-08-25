@@ -37,10 +37,22 @@ export const getAnime = async (page: number = 1, language?: string) => {
 };
 
 export const getDetails = async (id: string, language?: string) => {
-  const { data } = await tmdbClient.get(`/tv/${id}`, {
-    params: { append_to_response: 'credits,videos', language: toTMDBLanguage(language) },
-  });
-  return data;
+  try {
+    const { data } = await tmdbClient.get(`/tv/${id}`, {
+      params: { append_to_response: 'credits,videos', language: toTMDBLanguage(language) },
+    });
+    return data;
+  } catch (err: any) {
+    if (err?.response?.status === 404) {
+      try {
+        const { data } = await tmdbClient.get(`/movie/${id}`, {
+          params: { append_to_response: 'credits,videos', language: toTMDBLanguage(language) },
+        });
+        return data;
+      } catch (_) {}
+    }
+    throw err;
+  }
 };
 
 export const getSeasonDetails = async (id: string, seasonNumber: string, language?: string) => {

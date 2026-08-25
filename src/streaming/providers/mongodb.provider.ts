@@ -74,24 +74,29 @@ export class MongoDBProvider implements StreamingProvider {
       }
       if (!movie) return null;
 
-      // Priorité au streaming Uqload via son lecteur iframe (embed-<code>.html)
-      // dès qu'un fichier Uqload est prêt (uqloadCode présent). Le lien
-      // direct .mp4 n'est PAS utilisé pour le streaming : il est signé,
-      // éphémère et servi depuis un CDN non whitelisté (CSP media-src) → il ne
-      // sert qu'au téléchargement. L'iframe Uqload ne périme pas.
+      // 1. Priorité au lien direct direct (Vidzy/MP4 OpenOtaku) s'il est actif
+      const directUrl = resolveUrl(movie.lien);
+      if (directUrl && await isUrlAlive(directUrl)) {
+        return { provider: this.name, embedUrl: toEmbedUrl(directUrl), type: 'movie' };
+      }
+
+      // 2. Fallback Uqload
       if (movie.uqloadCode) {
         return { provider: this.name, embedUrl: uqloadEmbedUrl(movie.uqloadCode), type: 'movie' };
       }
 
-      // Fallback: lien stocké (embed DoodStream), converti en /e/.
-      // resolveUrl() vérifie que le lien n'est pas expiré (timestamp e=)
-      // isUrlAlive() vérifie que le serveur répond (HEAD)
-      const url = resolveUrl(movie.lien);
-      if (url && await isUrlAlive(url)) {
-        return { provider: this.name, embedUrl: toEmbedUrl(url), type: 'movie' };
+      // 3. Fallback Streamtape
+      if ((movie as any).streamtapeCode) {
+        return { provider: this.name, embedUrl: `https://streamtape.com/e/${(movie as any).streamtapeCode}`, type: 'movie' };
       }
 
-      console.log(`[MongoDB] Aucun lien valide pour "${movie.titre}" (uqload + lien morts ou expirés) → fallback`);
+      // 4. Fallback lien secondaire
+      const fallbackUrl = resolveUrl((movie as any).lienFallback);
+      if (fallbackUrl && await isUrlAlive(fallbackUrl)) {
+        return { provider: this.name, embedUrl: toEmbedUrl(fallbackUrl), type: 'movie' };
+      }
+
+      console.log(`[MongoDB] Aucun lien valide pour "${movie.titre}" → fallback providers`);
       return null;
     } catch (err) {
       console.error('[MongoDB] getMovieStream error:', err);
@@ -103,9 +108,7 @@ export class MongoDBProvider implements StreamingProvider {
     if (query.season === undefined || query.episode === undefined) return null;
 
     try {
-      // Priority 1: exact tmdbId match
       let serie = query.tmdbId ? await this.findSerie(query) : null;
-      // Priority 2: title regex fallback
       if (!serie && query.title) {
         const escaped = query.title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
         const byTitle = await Serie.find({ titre: { $regex: new RegExp(escaped, 'i') } }).exec();
@@ -119,29 +122,34 @@ export class MongoDBProvider implements StreamingProvider {
 
       if (!serie) return null;
 
-      let ep = serie.episodes.find(
+      let ep = serie.episodes?.find(
         (e: any) => Number(e.season) === Number(query.season) && Number(e.episodeNumber) === Number(query.episode)
       );
 
-      if (!ep || (!ep.uqloadLink && !ep.lien)) {
-        console.log(`[MongoDB] S${query.season}E${query.episode} indisponible pour "${serie.titre}" → skip`);
-        return null;
-      }
-
       if (!ep) return null;
 
-      // Priorité au lecteur iframe Uqload quand le fichier est prêt.
+      // 1. Priorité au lien direct (Vidzy/MP4) s'il est actif
+      const directUrl = resolveUrl(ep.lien);
+      if (directUrl && await isUrlAlive(directUrl)) {
+        return { provider: this.name, embedUrl: toEmbedUrl(directUrl), type: 'episode' };
+      }
+
+      // 2. Fallback Uqload
       if (ep.uqloadCode) {
         return { provider: this.name, embedUrl: uqloadEmbedUrl(ep.uqloadCode), type: 'episode' };
       }
 
-      // Fallback: lien stocké (embed DoodStream).
-      const url = resolveUrl(ep.lien);
-      if (url && await isUrlAlive(url)) {
-        return { provider: this.name, embedUrl: toEmbedUrl(url), type: 'episode' };
+      // 3. Fallback Streamtape
+      if ((ep as any).streamtapeCode) {
+        return { provider: this.name, embedUrl: `https://streamtape.com/e/${(ep as any).streamtapeCode}`, type: 'episode' };
       }
 
-      console.log(`[MongoDB] Aucun lien valide pour S${query.season}E${query.episode} de "${serie.titre}" → fallback`);
+      // 4. Fallback uqloadLink
+      if (ep.uqloadLink && await isUrlAlive(ep.uqloadLink)) {
+        return { provider: this.name, embedUrl: toEmbedUrl(ep.uqloadLink), type: 'episode' };
+      }
+
+      console.log(`[MongoDB] Aucun lien valide pour S${query.season}E${query.episode} de "${serie.titre}" → fallback providers`);
       return null;
     } catch (err) {
       console.error('[MongoDB] getEpisodeStream error:', err);

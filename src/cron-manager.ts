@@ -20,7 +20,7 @@ const GRACEFUL_KILL_MS = 5000;
 // Mapping centralisé : nom logique → chemin du script
 // Sert à la fois au scheduler et à l'endpoint POST /admin/cron/run/:taskName
 export const ALL_TASKS: Record<string, { label: string; path: string; command: 'tsx' | 'node' }> = {
-    'scraping-films':           { label: 'Scraping Films',            path: 'scraping/core/scrape-films.js',                 command: 'node' },
+    'scraping-films':           { label: 'Scraping Films',            path: 'scraping/core/scrape-films.ts',                 command: 'tsx' },
     'scraping-series':          { label: 'Scraping Séries',           path: 'scraping/core/scrape-series.ts',                command: 'tsx' },
     'scraping-animes':          { label: 'Scraping Animes',           path: 'scraping/core/scrape-animes.ts',                command: 'tsx' },
     'maintenance-liens':        { label: 'Maintenance Liens',         path: 'scraping/maintenance/maintainer.ts',           command: 'tsx' },
@@ -33,6 +33,7 @@ export const ALL_TASKS: Record<string, { label: string; path: string; command: '
     'fix-series-seasons':       { label: 'Fix Seasons Séries',        path: 'scraping/maintenance/fix-series-seasons.ts',   command: 'tsx' },
     'upload-doodstream-movies': { label: 'Upload Films DoodStream',   path: 'scraping/maintenance/upload-doodstream.ts',    command: 'tsx' },
     'upload-doodstream-series': { label: 'Upload Séries DoodStream',  path: 'scraping/maintenance/upload-series-doodstream.ts', command: 'tsx' },
+    'keepalive-uqload':         { label: 'KeepAlive Uqload',          path: 'scraping/maintenance/keepalive-uqload.ts',         command: 'tsx' },
     'link-movies':              { label: 'Link Movies (legacy)',      path: 'scripts/link-movies-tmdb.ts',                  command: 'tsx' },
     'link-series':              { label: 'Link Series (legacy)',      path: 'scripts/link-series-tmdb.ts',                  command: 'tsx' },
 };
@@ -71,37 +72,65 @@ function isPidAlive(pid: number): boolean {
     }
 }
 
-function resolveScript(relativePath: string): string {
+function resolveScript(relativePath: string): { command: string; args: string[] } {
+    const isProd = process.env.NODE_ENV === 'production' || __dirname.includes('dist');
+
+    if (isProd) {
+        const jsRel = relativePath.replace(/\.ts$/, '.js');
+        const distPath = path.join(__dirname, jsRel);
+        if (fs.existsSync(distPath)) {
+            return { command: 'node', args: [distPath] };
+        }
+    }
+
     let fullPath = path.join(__dirname, relativePath);
+    if (fs.existsSync(fullPath)) {
+        if (fullPath.endsWith('.js')) return { command: 'node', args: [fullPath] };
+        return { command: 'npx', args: ['tsx', fullPath] };
+    }
+
     const tsPath = fullPath.replace(/\.js$/, '.ts');
-    if (fs.existsSync(tsPath)) return tsPath;
-    return fullPath;
+    if (fs.existsSync(tsPath)) {
+        return { command: 'npx', args: ['tsx', tsPath] };
+    }
+
+    const jsPath = fullPath.replace(/\.ts$/, '.js');
+    if (fs.existsSync(jsPath)) {
+        return { command: 'node', args: [jsPath] };
+    }
+
+    const distFallback = fullPath.replace('/src/', '/dist/').replace(/\.ts$/, '.js');
+    if (fs.existsSync(distFallback)) {
+        return { command: 'node', args: [distFallback] };
+    }
+
+    const srcFallback = fullPath.replace('/dist/', '/src/').replace(/\.js$/, '.ts');
+    if (fs.existsSync(srcFallback)) {
+        return { command: 'npx', args: ['tsx', srcFallback] };
+    }
+
+    return { command: 'node', args: [fullPath] };
 }
 
-/**
- * Tue un arbre de process complet (le PGID du child + tous ses descendants).
- * SIGTERM d'abord, attend `graceMs`, puis SIGKILL si toujours vivant.
- */
 function killTree(child: ChildProcess | { pid: number }, graceMs = GRACEFUL_KILL_MS): Promise<boolean> {
     const pid = (child as any).pid;
     if (!pid || !Number.isFinite(pid) || pid <= 0) return Promise.resolve(false);
 
-    const pgid = -pid; // PGID = -PID quand detached: true
+    const pgid = -pid;
     return new Promise((resolve) => {
-        try { process.kill(pgid, 'SIGTERM'); } catch { /* le groupe peut déjà être mort */ }
+        try { process.kill(pgid, 'SIGTERM'); } catch { }
         const killTimer = setTimeout(() => {
             if (isPidAlive(pid)) {
-                try { process.kill(pgid, 'SIGKILL'); } catch { /* ignore */ }
+                try { process.kill(pgid, 'SIGKILL'); } catch { }
             }
             resolve(isPidAlive(pid));
         }, graceMs);
-        // Si le process exit avant le timer, on résout immédiatement.
         try {
             (child as any).once?.('exit', () => {
                 clearTimeout(killTimer);
                 resolve(false);
             });
-        } catch { /* ChildProcess-like sans .once, pas grave */ }
+        } catch { }
     });
 }
 
@@ -115,7 +144,7 @@ function runProcess(name: string, command: string, args: string[]) {
     if (child.pid) writePidFile(name, child.pid);
     runningProcesses.set(name, child);
 
-    child.stdout.on('data', (data) => {
+    child.stdout?.on('data', (data) => {
         for (const line of data.toString().split('\n').filter((l: string) => l)) {
             const msg = `[${name}] ${line}`;
             console.log(msg);
@@ -123,7 +152,7 @@ function runProcess(name: string, command: string, args: string[]) {
         }
     });
 
-    child.stderr.on('data', (data) => {
+    child.stderr?.on('data', (data) => {
         for (const line of data.toString().split('\n').filter((l: string) => l)) {
             const msg = `[${name}] ${line}`;
             console.error(msg);
@@ -144,11 +173,13 @@ function runProcess(name: string, command: string, args: string[]) {
 }
 
 function runScript(name: string, scriptRelativePath: string) {
-    runProcess(name, 'npx', ['tsx', resolveScript(scriptRelativePath)]);
+    const resolved = resolveScript(scriptRelativePath);
+    runProcess(name, resolved.command, resolved.args);
 }
 
 function runNodeScript(name: string, scriptRelativePath: string) {
-    runProcess(name, 'node', [resolveScript(scriptRelativePath)]);
+    const resolved = resolveScript(scriptRelativePath);
+    runProcess(name, resolved.command, resolved.args);
 }
 
 export const runner = runScript;
@@ -196,71 +227,26 @@ export function runTaskById(id: string): boolean {
  */
 export function getRunningTasks(): string[] {
     const out = new Set<string>();
-    // 1. Process trackés par le backend (et toujours vivants)
     for (const [name, child] of runningProcesses) {
-        if (child.pid && isPidAlive(child.pid)) out.add(name);
-        else runningProcesses.delete(name);
-    }
-    // 2. Process orphelins (lancés hors backend mais matchant une signature connue)
-    for (const entry of Object.values(ALL_TASKS)) {
-        if (out.has(entry.label)) continue;
-        if (scanProcessForLabel(entry.label)) out.add(entry.label);
+        if (child.pid && isPidAlive(child.pid)) {
+            out.add(name);
+        } else {
+            runningProcesses.delete(name);
+        }
     }
     return Array.from(out);
 }
 
-/**
- * Liste brute des process OS qui matchent une signature de scraper.
- * Utile pour le panneau debug et pour détecter des fantômes.
- */
 export function listOsProcesses(): Array<{ label: string; pid: number; cmd: string }> {
     const results: Array<{ label: string; pid: number; cmd: string }> = [];
-    let lines: string;
-    try {
-        // ps -eo pid,cmd pour avoir PID + commande
-        lines = execSync('ps -eo pid=,cmd=', { encoding: 'utf8', maxBuffer: 4 * 1024 * 1024 });
-    } catch {
-        return results;
-    }
-    for (const raw of lines.split('\n')) {
-        const line = raw.trim();
-        if (!line) continue;
-        const match = line.match(/^(\d+)\s+(.*)$/);
-        if (!match) continue;
-        const pid = parseInt(match[1], 10);
-        const cmd = match[2];
-        for (const entry of Object.values(ALL_TASKS)) {
-            // On détecte via le chemin du script dans la commande
-            const scriptBasename = entry.path.split('/').pop()?.replace(/\.ts$/, '').replace(/\.js$/, '');
-            if (!scriptBasename) continue;
-            if (cmd.includes(scriptBasename) && (cmd.includes('tsx') || cmd.includes('node'))) {
-                results.push({ label: entry.label, pid, cmd });
-                break;
-            }
+    for (const [label, child] of runningProcesses) {
+        if (child.pid && isPidAlive(child.pid)) {
+            results.push({ label, pid: child.pid, cmd: `node/tsx ${label}` });
         }
     }
     return results;
 }
 
-function scanProcessForLabel(label: string): boolean {
-    const entry = Object.values(ALL_TASKS).find(t => t.label === label);
-    if (!entry) return false;
-    const scriptBasename = entry.path.split('/').pop()?.replace(/\.ts$/, '').replace(/\.js$/, '');
-    if (!scriptBasename) return false;
-    try {
-        const out = execSync(`ps -eo pid=,cmd=`, { encoding: 'utf8' });
-        return out.split('\n').some(line => {
-            const l = line.trim();
-            return l && l.includes(scriptBasename) && (l.includes('tsx') || l.includes('node'));
-        });
-    } catch {
-        return false;
-    }
-}
-
-/**
- * Indique si une tâche est en cours (basé sur la source de vérité OS).
- */
 export function isTaskRunning(label: string): boolean {
     return getRunningTasks().includes(label);
 }
@@ -322,22 +308,14 @@ export function getSystemCronStatus(): { present: boolean; lines: string[] } {
 }
 
 export function runScrapingTasks() {
-    if (process.env.SCRAPER_API_URL) {
-        console.log(`[${new Date().toISOString()}] [Cron] SCRAPER_API_URL défini, scraping délégué au scraper distant`);
-        return;
-    }
-    console.log(`[${new Date().toISOString()}] [Cron] Lancement des tâches de scraping...`);
-    runner('Scraping Films', 'scraping/core/scrape-films.js');
-    runner('Scraping Séries', 'scraping/core/scrape-series.js');
-    runner('Scraping Animes', 'scraping/core/scrape-animes.js');
+    console.log(`[${new Date().toISOString()}] [Cron] Lancement des tâches de scraping internes...`);
+    runner('Scraping Films', 'scraping/core/scrape-films.ts');
+    runner('Scraping Séries', 'scraping/core/scrape-series.ts');
+    runner('Scraping Animes', 'scraping/core/scrape-animes.ts');
 }
 
 export function runMaintenanceTasks() {
-    if (process.env.SCRAPER_API_URL) {
-        console.log(`[${new Date().toISOString()}] [Cron] SCRAPER_API_URL défini, maintenance déléguée au scraper distant`);
-        return;
-    }
-    console.log(`[${new Date().toISOString()}] [Cron] Lancement des tâches de maintenance...`);
+    console.log(`[${new Date().toISOString()}] [Cron] Lancement des tâches de maintenance internes...`);
     runner('Vérification Liens Morts', 'scraping/maintenance/check-all-links.ts');
     runner('Maintenance Liens', 'scraping/maintenance/maintainer.ts');
     runner('Linking TMDB Films', 'scraping/maintenance/link-movies-tmdb.ts');
@@ -346,15 +324,23 @@ export function runMaintenanceTasks() {
     runner('Sync Séries → MongoDB', 'scraping/maintenance/sync-series-to-mongo.ts');
 }
 
+export function runKeepAliveTasks() {
+    console.log(`[${new Date().toISOString()}] [Cron] Lancement du Keep-Alive Uqload...`);
+    runner('KeepAlive Uqload', 'scraping/maintenance/keepalive-uqload.ts');
+}
+
 export function startCron() {
     if (isRunning) return;
     cronTasks = [
         cron.schedule('*/10 * * * *', runMaintenanceTasks),
         cron.schedule('0 3 * * *', runScrapingTasks),
+        cron.schedule('0 3 * * 0', runKeepAliveTasks), // Chaque dimanche à 03h00 UTC
     ];
     isRunning = true;
-    appendLog('[Cron] Tâches planifiées démarrées (toutes les 10min + scraping 03:00)');
+    appendLog('[Cron] Tâches planifiées démarrées (10min + scraping 03:00 + KeepAlive dimanche 03:00)');
     console.log('[Cron] Tâches planifiées démarrées.');
+
+    // Scraping automatique au démarrage supprimé : contrôlé manuellement par l'admin.
 }
 
 export async function stopCron() {

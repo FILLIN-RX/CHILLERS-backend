@@ -142,6 +142,122 @@ export async function generatePosterImage(input: PosterInput): Promise<string | 
   return null;
 }
 
+const GROQ_API_URL = 'https://api.groq.com/openai/v1';
+
+export interface AICompletionOptions {
+  prompt: string;
+  systemPrompt?: string;
+  maxTokens?: number;
+  temperature?: number;
+  jsonMode?: boolean;
+}
+
+export interface AICompletionResult {
+  text: string;
+  usedProvider: 'gemini' | 'groq';
+}
+
+/**
+ * Moteur d'IA unifié avec tentative multi-modèles :
+ * Tente les modèles Gemini (ex: gemini-3.6-flash, gemini-2.5-flash),
+ * et bascule automatiquement sur Groq (ex: openai/gpt-oss-20b, qwen/qwen3.6-27b) en secours.
+ */
+export async function generateAICompletion(options: AICompletionOptions): Promise<AICompletionResult> {
+  const { prompt, systemPrompt, maxTokens = 2000, temperature = 0.7, jsonMode = false } = options;
+
+  const geminiKey = process.env.AI_GEMINI_KEY || process.env.GEMINI_API_KEY;
+  const groqKey = process.env.AI_GROQ_KEY || process.env.GROQ_API_KEY;
+
+  const geminiModels = [
+    process.env.AI_GEMINI_MODEL,
+    'gemini-3.6-flash',
+    'gemini-2.5-flash',
+  ].filter((m, i, self): m is string => Boolean(m) && self.indexOf(m) === i);
+
+  const groqModels = [
+    process.env.AI_GROQ_MODEL,
+    'openai/gpt-oss-20b',
+    'qwen/qwen3.6-27b',
+    'openai/gpt-oss-120b',
+    'groq/compound-mini',
+  ].filter((m, i, self): m is string => Boolean(m) && self.indexOf(m) === i);
+
+  // 1. Tenter Gemini avec les différents modèles valides
+  if (geminiKey) {
+    for (const model of geminiModels) {
+      try {
+        const contents = systemPrompt
+          ? [{ role: 'user', parts: [{ text: `${systemPrompt}\n\n${prompt}` }] }]
+          : [{ role: 'user', parts: [{ text: prompt }] }];
+
+        const reqBody: any = { contents, generationConfig: { temperature, maxOutputTokens: maxTokens } };
+        if (jsonMode) {
+          reqBody.generationConfig.responseMimeType = 'application/json';
+        }
+
+        const { data } = await axios.post(
+          `${GEMINI_API_URL}/models/${model}:generateContent`,
+          reqBody,
+          { params: { key: geminiKey }, timeout: 30000 }
+        );
+
+        const resultText = data?.candidates?.[0]?.content?.parts?.map((p: any) => p.text).join('').trim();
+        if (resultText) {
+          return { text: resultText, usedProvider: 'gemini' };
+        }
+      } catch (err: any) {
+        console.warn(`[AI] Gemini API (${model}) a échoué:`, err?.response?.data?.error?.message || err?.message);
+      }
+    }
+  }
+
+  // 2. Secours : Groq API avec les modèles actifs de votre compte
+  if (groqKey) {
+    for (const model of groqModels) {
+      try {
+        const messages: any[] = [];
+        if (systemPrompt) {
+          messages.push({ role: 'system', content: systemPrompt });
+        }
+        messages.push({ role: 'user', content: prompt });
+
+        const reqBody: any = {
+          model,
+          messages,
+          max_tokens: maxTokens,
+          temperature,
+        };
+        if (jsonMode) {
+          reqBody.response_format = { type: 'json_object' };
+        }
+
+        const { data } = await axios.post(
+          `${GROQ_API_URL}/chat/completions`,
+          reqBody,
+          {
+            headers: {
+              Authorization: `Bearer ${groqKey}`,
+              'Content-Type': 'application/json',
+            },
+            timeout: 30000,
+          }
+        );
+
+        const resultText = data?.choices?.[0]?.message?.content?.trim();
+        if (resultText) {
+          return { text: resultText, usedProvider: 'groq' };
+        }
+      } catch (err: any) {
+        console.warn(`[AI] Groq API (${model}) a échoué:`, err?.response?.data?.error?.message || err?.message);
+      }
+    }
+  }
+
+  throw new Error(
+    'Aucun service IA n\'a pu répondre. Veuillez vérifier vos clés d\'API dans le fichier .env du backend.'
+  );
+}
+
 async function saveGeneratedImage(base64: string, filename: string): Promise<string | null> {
   try {
     const fs = await import('fs');
@@ -156,3 +272,4 @@ async function saveGeneratedImage(base64: string, filename: string): Promise<str
     return null;
   }
 }
+

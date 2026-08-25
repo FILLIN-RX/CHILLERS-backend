@@ -12,17 +12,47 @@ const API_BASE = 'https://uqload.is/api';
 
 export class UqloadClient {
   private apiKey: string;
+  private static lastCallTime = 0;
+  private static readonly MIN_INTERVAL_MS = 650; // Garantit max ~90 req/min
 
   constructor(apiKey: string) {
     this.apiKey = apiKey;
   }
 
-  private async get<T>(endpoint: string, params: Record<string, any> = {}): Promise<UqloadApiResponse<T>> {
-    const { data } = await axios.get(`${API_BASE}${endpoint}`, {
-      params: { key: this.apiKey, ...params },
-      timeout: 30000,
-    });
-    return data;
+  private async throttle(): Promise<void> {
+    const now = Date.now();
+    const elapsed = now - UqloadClient.lastCallTime;
+    if (elapsed < UqloadClient.MIN_INTERVAL_MS) {
+      await new Promise(r => setTimeout(r, UqloadClient.MIN_INTERVAL_MS - elapsed));
+    }
+    UqloadClient.lastCallTime = Date.now();
+  }
+
+  private async get<T>(endpoint: string, params: Record<string, any> = {}, retryCount = 0): Promise<UqloadApiResponse<T>> {
+    await this.throttle();
+    try {
+      const { data } = await axios.get(`${API_BASE}${endpoint}`, {
+        params: { key: this.apiKey, ...params },
+        timeout: 30000,
+      });
+
+      if (data?.msg && typeof data.msg === 'string' && data.msg.toLowerCase().includes('limit reached')) {
+        if (retryCount < 3) {
+          console.log(`[UqloadClient] ⏳ Limite de 100 req/min Uqload atteinte. Pause de 22s avant nouvel essai (${retryCount + 1}/3)...`);
+          await new Promise(r => setTimeout(r, 22000));
+          return this.get<T>(endpoint, params, retryCount + 1);
+        }
+      }
+
+      return data;
+    } catch (err: any) {
+      if ((err?.response?.status === 429 || err?.message?.includes('429')) && retryCount < 3) {
+        console.log(`[UqloadClient] ⏳ HTTP 429 Rate limit Uqload. Pause de 22s avant nouvel essai (${retryCount + 1}/3)...`);
+        await new Promise(r => setTimeout(r, 22000));
+        return this.get<T>(endpoint, params, retryCount + 1);
+      }
+      throw err;
+    }
   }
 
   async getAccountInfo() {

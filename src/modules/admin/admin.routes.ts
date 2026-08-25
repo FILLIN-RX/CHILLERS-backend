@@ -46,6 +46,8 @@ router.post('/uqload/stop', adminMiddleware, adminController.uqloadStop);
 router.get('/uqload/status', adminMiddleware, adminController.uqloadStatus);
 router.get('/uqload/pending', adminMiddleware, adminController.uqloadPending);
 router.get('/uqload/pending-both', adminMiddleware, adminController.uqloadPendingBoth);
+router.get('/uqload/files', adminMiddleware, adminController.uqloadFiles);
+router.get('/uqload/file-info/:code', adminMiddleware, adminController.uqloadFileInfo);
 
 router.get('/media/tmdb-search', adminMiddleware, adminController.tmdbSearch);
 router.post('/media/manual', adminMiddleware, adminController.createManualMedia);

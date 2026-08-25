@@ -1,12 +1,36 @@
-const { chromium } = require('playwright');
-const mongoose = require('mongoose');
 const axios = require('axios');
+const mongoose = require('mongoose');
 const Movie = require('../../models/Movie').default;
 const ScraperState = require('../../models/ScraperState').default;
 const { connectDB } = require('../../config/db');
-const { browserConfig } = require('../../config/browser');
 const { UqloadClient } = require('../../modules/uqload/uqload.client');
 const { autoLink } = require('../maintenance/auto-link');
+
+const BASE_URL = 'https://www.open-otaku.me';
+const MAX_EMPTY_RETRIES = 5;
+const CONCURRENCY = 3;
+
+function toDownloadUrl(url) {
+  if (!url) return '';
+  if (url.includes('vidzy.')) return url.replace('/embed-', '/d/').replace('.html', '_n.html');
+  if (url.includes('luluvid.')) return url.replace('/embed-', '/d/').replace('.html', '');
+  return url;
+}
+
+async function getDirectLink(embedUrl) {
+  try {
+    const dlUrl = toDownloadUrl(embedUrl);
+    if (!dlUrl) return null;
+    const { data } = await axios.get(`${BASE_URL}/api/dl`, {
+      params: { url: dlUrl },
+      timeout: 20000,
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    return data && data.success && data.downloadUrl ? data.downloadUrl : null;
+  } catch {
+    return null;
+  }
+}
 
 async function uploadToUqload(client, titre, lien, movieId) {
   if (!client) return;
@@ -58,121 +82,191 @@ async function uploadToDoodStream(titre, lien, movieId) {
 }
 
 async function getLastPage() {
-    try {
-        const state = await ScraperState.findOne({ name: 'films' });
-        return state ? state.lastPage : 1;
-    } catch {
-        return 1;
-    }
+  try {
+    const state = await ScraperState.findOne({ name: 'films' });
+    return state ? state.lastPage : 1;
+  } catch {
+    return 1;
+  }
 }
 
 async function saveLastPage(page) {
-    await ScraperState.findOneAndUpdate(
-        { name: 'films' },
-        { $set: { lastPage: page, updatedAt: new Date() } },
-        { upsert: true }
+  await ScraperState.findOneAndUpdate(
+    { name: 'films' },
+    { $set: { lastPage: page, updatedAt: new Date() } },
+    { upsert: true }
+  );
+}
+
+function sleep(ms) {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+async function fetchFilmsPage(page) {
+  try {
+    const { data } = await axios.get(`${BASE_URL}/api/fs-home`, {
+      params: { category: 'films', page },
+      timeout: 30000,
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    return Array.isArray(data?.items) ? data.items : [];
+  } catch (err) {
+    console.error(`[ScrapeFilms] Erreur fetch page ${page}:`, err.message);
+    return [];
+  }
+}
+
+async function fetchWatchDetails(id) {
+  try {
+    const { data } = await axios.get(`${BASE_URL}/api/fs-watch`, {
+      params: { id },
+      timeout: 30000,
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+    return data || {};
+  } catch (err) {
+    console.error(`[ScrapeFilms] Erreur fetch fs-watch (${id}):`, err.message);
+    return null;
+  }
+}
+
+async function processFilm(item, uqloadClient) {
+  const titre = item.title.trim();
+  const ficheUrl = `${BASE_URL}/?watch_fs=${item.id}`;
+
+  try {
+    console.log(`[ScrapeFilms] Traitement : ${titre} (ID: ${item.id})`);
+    const watch = await fetchWatchDetails(item.id);
+    if (!watch) return;
+
+    const players = watch.players || {};
+    const embedUrl =
+      players.vidzy?.default ||
+      players.vidzy?.vff ||
+      players.vidzy?.vf ||
+      players.vidzy?.vostfr ||
+      players.premium?.default ||
+      (Object.values(players)[0] && Object.values(players)[0].default) ||
+      '';
+
+    let directLink = null;
+    if (embedUrl) {
+      directLink = await getDirectLink(embedUrl);
+    }
+
+    if (!directLink) {
+      console.log(`[ScrapeFilms] ⚠️ Lien direct introuvable pour : ${titre}`);
+      return;
+    }
+
+    let year = undefined;
+    if (watch.meta?.year) {
+      const parsed = parseInt(String(watch.meta.year), 10);
+      if (parsed > 1900 && parsed < 2100) year = parsed;
+    }
+    const poster = watch.meta?.poster || item.poster || undefined;
+
+    const updateData = {
+      titre,
+      pageUrl: ficheUrl,
+      lien: directLink,
+      ...(year ? { year } : {}),
+      ...(poster ? { posterUrl: poster, posterSource: 'tmdb' } : {})
+    };
+
+    const saved = await Movie.findOneAndUpdate(
+      { titre },
+      { $set: updateData },
+      { upsert: true, returnDocument: 'after' }
     );
+
+    console.log(`[ScrapeFilms] ✅ Sauvegardé : ${titre}`);
+    if (saved) {
+      if (uqloadClient) await uploadToUqload(uqloadClient, titre, directLink, saved._id);
+      await uploadToDoodStream(titre, directLink, saved._id);
+      autoLink('movie', saved._id.toString());
+    }
+  } catch (err) {
+    console.error(`[ScrapeFilms] ❌ Erreur sur ${titre}:`, err.message);
+  }
 }
 
 async function scrapeFilms() {
-    await connectDB();
+  console.log('[START] scrapeFilms() called — connecting to MongoDB...');
+  await connectDB();
+  console.log('[OK] MongoDB connected, scraper direct API initialisé.');
 
-    const browser = await chromium.launch(browserConfig);
-    const page = await browser.newPage();
-    const apiKey = process.env.UQLOAD_API_KEY;
-    const uqload = apiKey ? new UqloadClient(apiKey) : null;
+  const uqloadKey = process.env.UQLOAD_API_KEY;
+  const uqloadClient = uqloadKey ? new UqloadClient(uqloadKey) : null;
 
-    let shuttingDown = false;
-    process.on('SIGTERM', async () => {
-        if (shuttingDown) return;
-        shuttingDown = true;
-        console.log('\n[SIGTERM] Arrêt demandé, fermeture du navigateur...');
-        await browser.close().catch(() => {});
-        await mongoose.disconnect().catch(() => {});
-        process.exit(0);
-    });
-
+  while (true) {
     let currentPage = await getLastPage();
     let hasMorePages = true;
-    console.log(`Reprise à la page ${currentPage}`);
+    console.log(`[ScrapeFilms] Démarrage boucle depuis la page ${currentPage}`);
 
-    while (hasMorePages && !shuttingDown) {
-        const url = `https://www.open-otaku.me/?cat=films&page=${currentPage}`;
-        console.log(`\n--- Navigation vers ${url} ---`);
-        
-        await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 60000 });
-        
-        try {
-            await page.waitForSelector('.fs-card', { timeout: 30000 });
-        } catch (e) {
-            console.log("Fin de la liste.");
-            hasMorePages = false;
+    while (hasMorePages) {
+      console.log(`\n--- Page ${currentPage} ---`);
+      let items = await fetchFilmsPage(currentPage);
+
+      if (items.length === 0) {
+        let retries = 0;
+        let pageLoaded = false;
+        while (retries < MAX_EMPTY_RETRIES) {
+          retries++;
+          console.log(`Page ${currentPage} vide (tentative ${retries}/${MAX_EMPTY_RETRIES}) — attend 5s...`);
+          await sleep(5000);
+          items = await fetchFilmsPage(currentPage);
+          if (items.length > 0) {
+            pageLoaded = true;
             break;
+          }
         }
-
-        let cards = await page.$$('.fs-card');
-        console.log(`Films trouvés sur la page : ${cards.length}`);
-
-        for (let i = 0; i < cards.length; i++) {
-            let titre = `<film #${i}>`;
-            try {
-                let currentCards = await page.$$('.fs-card');
-                let card = currentCards[i];
-                titre = await card.$eval('.fs-card-title', el => el.innerText.trim());
-
-                if (titre.includes("Saison") || titre.includes("Épisode")) continue;
-
-                const existingFilm = await Movie.findOne({ titre: titre });
-                if (existingFilm && existingFilm.pageUrl && existingFilm.lien) {
-                    console.log(`Film déjà traité : ${titre}`);
-                    continue;
-                }
-
-                console.log(`Traitement du film : ${titre}`);
-                await card.click();
-                await page.waitForLoadState('domcontentloaded');
-                await page.waitForTimeout(1000);
-
-                const pageUrl = page.url();
-
-                await page.click('button#fs-quick-download', { force: true });
-                await page.waitForTimeout(10000);
-
-                let dlLink = await page.$('a#fs-dl-link');
-                let link = dlLink ? await dlLink.getAttribute('href') : "#";
-
-                if (link && link !== "#") {
-                    const saved = await Movie.findOneAndUpdate(
-                        { titre: titre },
-                        { $set: { titre, pageUrl, lien: link } },
-                        { upsert: true, returnDocument: 'after' }
-                    );
-                    console.log(`Film sauvegardé dans MongoDB : ${titre}`);
-                    if (saved) {
-                        await uploadToUqload(uqload, titre, link, saved._id.toString());
-                        await uploadToDoodStream(titre, link, saved._id.toString());
-                        // Liaison TMDB en arrière-plan (fire-and-forget)
-                        autoLink('movie', saved._id.toString());
-                    }
-                }
-
-                await page.goto(url, { waitUntil: 'domcontentloaded' });
-                await page.waitForSelector('.fs-card');
-            } catch (e) {
-                console.error(`Erreur film ${titre}:`, e.message);
-                try {
-                    await page.goto(url, { waitUntil: 'domcontentloaded' });
-                    await page.waitForSelector('.fs-card');
-                } catch (recoveryErr) {
-                    console.error(`Récupération échouée pour ${titre}:`, recoveryErr.message);
-                }
-            }
+        if (!pageLoaded) {
+          console.log(`Page ${currentPage} toujours vide après ${MAX_EMPTY_RETRIES} tentatives — fin du cycle, retour page 1`);
+          hasMorePages = false;
+          await saveLastPage(1);
+          break;
         }
-        currentPage++;
-        await saveLastPage(currentPage);
+      }
+
+      console.log(`Films trouvés sur la page : ${items.length}`);
+      const validItems = items.filter(it => it.title && !it.title.includes('Saison') && !it.title.includes('Épisode'));
+      const titles = validItems.map(it => it.title.trim());
+
+      const existingMovies = await Movie.find(
+        { titre: { $in: titles } },
+        { titre: 1, pageUrl: 1, lien: 1 }
+      ).lean();
+      const existingSet = new Set(
+        existingMovies.filter(m => m.pageUrl && m.lien).map(m => m.titre)
+      );
+
+      const toProcess = validItems.filter(it => {
+        if (existingSet.has(it.title.trim())) {
+          console.log(`Déjà traité : ${it.title.trim()}`);
+          return false;
+        }
+        return true;
+      });
+
+      console.log(`Films restants à traiter : ${toProcess.length}/${validItems.length}`);
+
+      for (let i = 0; i < toProcess.length; i += CONCURRENCY) {
+        const chunk = toProcess.slice(i, i + CONCURRENCY);
+        await Promise.all(chunk.map(it => processFilm(it, uqloadClient)));
+      }
+
+      currentPage++;
+      await saveLastPage(currentPage);
     }
-    await browser.close();
-    await mongoose.disconnect();
-    console.log("Scraping terminé.");
+
+    console.log("[ScrapeFilms] Cycle terminé, redémarrage dans 10s...");
+    await sleep(10000);
+  }
 }
-scrapeFilms().catch(console.error);
+
+module.exports = { scrapeFilms };
+
+if (require.main === module) {
+  scrapeFilms().catch(console.error);
+}

@@ -1,60 +1,40 @@
-import { searchAndNavigateToSeries, getSpecificEpisodeLink } from '../../modules/otaku/otaku.service';
-import { chromium } from 'playwright';
-import { browserConfig } from '../../config/browser';
+import { searchOtaku, getSpecificEpisodeLink } from '../../modules/otaku/otaku.service';
 import Movie from '../../models/Movie';
 import Serie from '../../models/Serie';
 import { autoLink } from '../maintenance/auto-link';
 
 /**
- * Recherche et récupère les informations pour un film ou une série s'il est manquant
+ * Recherche et récupère les informations pour un film ou une série s'il est manquant via direct API
  */
 export async function fetchMissingMedia(title: string, type: 'movie' | 'series', episodeNum?: string) {
-    console.log(`[OnDemand] Recherche de : "${title}" (${type})...`);
-    
-    const browser = await chromium.launch(browserConfig);
-    const page = await browser.newPage();
-    
-    const navigated = await searchAndNavigateToSeries(page, title);
-    if (!navigated) {
-        await browser.close();
-        return;
-    }
-
-    let result = null;
+    console.log(`[OnDemand Direct API] Recherche de : "${title}" (${type})...`);
 
     if (type === 'series' && episodeNum) {
-        const link = await getSpecificEpisodeLink(page, episodeNum);
+        const link = await getSpecificEpisodeLink(null, episodeNum, null, title);
         if (link) {
-            result = { titre: title, episode: `Ép ${episodeNum}`, lien: link };
-            // Update MongoDB Serie
+            const result = { titre: title, episode: `Ép ${episodeNum}`, lien: link };
             const updated = await Serie.findOneAndUpdate(
                 { titre: title },
                 { $push: { episodes: { episode: `Ép ${episodeNum}`, lien: link } } },
                 { upsert: true, returnDocument: 'after' }
             );
-            // Liaison TMDB en arrière-plan (fire-and-forget)
             if (updated?._id) autoLink('series', updated._id.toString());
+            return result;
         }
     } else {
-        const dlBtn = page.locator('button#fs-quick-download');
-        await dlBtn.click({ force: true });
-        await page.waitForTimeout(8000);
-        const dlLink = page.locator('a#fs-dl-link');
-        const link = await dlLink.getAttribute('href');
-        result = { titre: title, lien: link };
-
-        // Update MongoDB Movie
-        const updated = await Movie.findOneAndUpdate(
-            { titre: title },
-            { $set: { titre: title, pageUrl: page.url(), lien: link } },
-            { upsert: true, returnDocument: 'after' }
-        );
-        // Liaison TMDB en arrière-plan (fire-and-forget)
-        if (updated?._id) autoLink('movie', updated._id.toString());
+        const result = await searchOtaku(title, type);
+        if (result && result.lien) {
+            const updated = await Movie.findOneAndUpdate(
+                { titre: title },
+                { $set: { titre: result.titre, lien: result.lien } },
+                { upsert: true, returnDocument: 'after' }
+            );
+            if (updated?._id) autoLink('movie', updated._id.toString());
+            return { titre: result.titre, lien: result.lien };
+        }
     }
 
-    await browser.close();
-    return result;
+    return null;
 }
 
 if (process.argv[1] && process.argv[1].includes('on-demand-fetch')) {
