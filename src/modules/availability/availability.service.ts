@@ -2,6 +2,7 @@ import axios from 'axios';
 import Movie from '../../models/Movie';
 import Serie from '../../models/Serie';
 import { getFileInfo } from '../doodstream/doodstream.service';
+import { detectAudioLanguage } from '../../utils/audio-language';
 
 export interface ScanProgress {
   running: boolean;
@@ -171,16 +172,18 @@ export async function scanAvailability(type: 'movie' | 'series' | 'all' = 'all')
 
     if (totalMovies > 0) {
       scanProgress.lastMessage = `Scan des films (${totalMovies})...`;
-      const cursor = Movie.find({}).select('titre tmdbId lien uqloadLink uqloadHls streamtapeLink fileCode uqloadCode').lean().cursor();
+      const cursor = Movie.find({}).select('titre pageUrl tmdbId lien lienOriginal uqloadLink uqloadHls streamtapeLink fileCode uqloadCode langueAudio').lean().cursor();
       const batch: any[] = [];
       for await (const movie of cursor) {
         batch.push(movie);
         if (batch.length >= 25) {
           await runPool(batch, async (m) => {
             const res = await checkMovie(m);
+            const audio = detectAudioLanguage(m);
             await Movie.updateOne({ _id: m._id }, {
               disponible: res.streaming && res.download,
               disponibleCheckedAt: new Date(),
+              langueAudio: m.langueAudio || audio.langueAudio,
             });
             if (res.streaming && res.download) scanProgress.ok++; else scanProgress.ko++;
             scanProgress.processed++;
@@ -191,9 +194,11 @@ export async function scanAvailability(type: 'movie' | 'series' | 'all' = 'all')
       }
       await runPool(batch, async (m) => {
         const res = await checkMovie(m);
+        const audio = detectAudioLanguage(m);
         await Movie.updateOne({ _id: m._id }, {
           disponible: res.streaming && res.download,
           disponibleCheckedAt: new Date(),
+          langueAudio: m.langueAudio || audio.langueAudio,
         });
         if (res.streaming && res.download) scanProgress.ok++; else scanProgress.ko++;
         scanProgress.processed++;
@@ -203,16 +208,18 @@ export async function scanAvailability(type: 'movie' | 'series' | 'all' = 'all')
 
     if (totalSeries > 0) {
       scanProgress.lastMessage = `Scan des séries (${totalSeries})...`;
-      const cursor = Serie.find({}).select('titre tmdbId episodes').lean().cursor();
+      const cursor = Serie.find({}).select('titre pageUrl tmdbId episodes langueAudio').lean().cursor();
       const batch: any[] = [];
       for await (const serie of cursor) {
         batch.push(serie);
         if (batch.length >= 25) {
           await runPool(batch, async (s) => {
             const res = await checkSerie(s);
+            const audio = detectAudioLanguage(s);
             await Serie.updateOne({ _id: s._id }, {
               disponible: res.streaming && res.download,
               disponibleCheckedAt: new Date(),
+              langueAudio: s.langueAudio || audio.langueAudio,
             });
             if (res.streaming && res.download) scanProgress.ok++; else scanProgress.ko++;
             scanProgress.processed++;
@@ -223,9 +230,11 @@ export async function scanAvailability(type: 'movie' | 'series' | 'all' = 'all')
       }
       await runPool(batch, async (s) => {
         const res = await checkSerie(s);
+        const audio = detectAudioLanguage(s);
         await Serie.updateOne({ _id: s._id }, {
           disponible: res.streaming && res.download,
           disponibleCheckedAt: new Date(),
+          langueAudio: s.langueAudio || audio.langueAudio,
         });
         if (res.streaming && res.download) scanProgress.ok++; else scanProgress.ko++;
         scanProgress.processed++;
@@ -239,26 +248,34 @@ export async function scanAvailability(type: 'movie' | 'series' | 'all' = 'all')
   }
 }
 
-export async function getBatchAvailability(type: 'movie' | 'tv', ids: number[]): Promise<Record<string, { disponible: boolean; streaming: boolean; download: boolean }>> {
+export async function getBatchAvailability(type: 'movie' | 'tv', ids: number[]): Promise<Record<string, { disponible: boolean; streaming: boolean; download: boolean; langueAudio?: string; isFrenchAudio?: boolean }>> {
   const result: Record<string, any> = {};
   if (ids.length === 0) return result;
 
   if (type === 'movie') {
-    const movies = await Movie.find({ tmdbId: { $in: ids } }).select('tmdbId lien uqloadLink streamtapeLink fileCode disponible').lean();
+    const movies = await Movie.find({ tmdbId: { $in: ids } }).select('titre tmdbId lien lienOriginal pageUrl uqloadLink streamtapeLink fileCode disponible langueAudio').lean();
     for (const m of movies) {
+      const audio = detectAudioLanguage(m);
+      const langueAudio = m.langueAudio && m.langueAudio !== 'UNKNOWN' ? m.langueAudio : audio.langueAudio;
       result[String(m.tmdbId)] = {
         disponible: !!m.disponible,
         streaming: await checkStreaming(m),
         download: await checkDownload(m),
+        langueAudio,
+        isFrenchAudio: langueAudio === 'VF' || langueAudio === 'VFF' || langueAudio === 'VFQ',
       };
     }
   } else {
-    const series = await Serie.find({ tmdbId: { $in: ids } }).select('tmdbId episodes disponible').lean();
+    const series = await Serie.find({ tmdbId: { $in: ids } }).select('titre tmdbId pageUrl episodes disponible langueAudio').lean();
     for (const s of series) {
+      const audio = detectAudioLanguage(s);
+      const langueAudio = s.langueAudio && s.langueAudio !== 'UNKNOWN' ? s.langueAudio : audio.langueAudio;
       result[String(s.tmdbId)] = {
         disponible: !!s.disponible,
         streaming: await checkStreaming(s.episodes?.[0] || s),
         download: await checkDownload(s.episodes?.[0] || s),
+        langueAudio,
+        isFrenchAudio: langueAudio === 'VF' || langueAudio === 'VFF' || langueAudio === 'VFQ',
       };
     }
   }

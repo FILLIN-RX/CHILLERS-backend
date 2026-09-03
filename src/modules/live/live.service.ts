@@ -64,7 +64,7 @@ export async function updateChannel(id, input) {
         const nextSlug = await ensureUniqueSlug(slugify(input.name), id);
         patch.slug = nextSlug;
     }
-    return LiveChannel.findByIdAndUpdate(id, { $set: patch }, { new: true, runValidators: true }).lean();
+    return LiveChannel.findByIdAndUpdate(id, { $set: patch }, { returnDocument: 'after', runValidators: true }).lean();
 }
 export async function deleteChannel(id) {
     const LiveChannel = await (0, live_db_1.getLiveChannelModel)();

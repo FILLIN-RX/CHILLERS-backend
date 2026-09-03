@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { adminMiddleware, adminSseMiddleware } from './admin.middleware';
 import * as adminController from './admin.controller';
+import * as subController from './subscription.controller';
 import { mediaUpload } from './media.upload';
 
 const router = Router();
@@ -56,5 +57,11 @@ router.post('/media/manual/upload', adminMiddleware, mediaUpload.array('files', 
 // Scrapper distant proxy routes
 router.get('/scrapper/{*path}', adminMiddleware, adminController.scrapperProxyGet);
 router.post('/scrapper/{*path}', adminMiddleware, adminController.scrapperProxyPost);
+
+// Subscription Plans
+router.get('/subscriptions', adminMiddleware, subController.getPlans);
+router.post('/subscriptions', adminMiddleware, subController.createPlan);
+router.put('/subscriptions/:id', adminMiddleware, subController.updatePlan);
+router.delete('/subscriptions/:id', adminMiddleware, subController.deletePlan);
 
 export default router;

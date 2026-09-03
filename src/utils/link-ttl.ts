@@ -20,9 +20,11 @@ export function isSignedLinkExpired(url: string): boolean {
     const expValue = parseInt(eParam, 10);
     if (isNaN(expValue)) return false;
 
+    const sParam = u.searchParams.get('s');
+    const nowSeconds = Math.floor(Date.now() / 1000);
+
     if (expValue >= 1_000_000_000) {
       // Epoch UNIX absolu (secondes)
-      const nowSeconds = Math.floor(Date.now() / 1000);
       const expired = nowSeconds > expValue;
       if (expired) {
         console.warn(`[LinkTTL] Lien expiré (e=${expValue}, now=${nowSeconds}): ${url.slice(0, 80)}...`);
@@ -30,8 +32,19 @@ export function isSignedLinkExpired(url: string): boolean {
       return expired;
     }
 
-    // Durée relative en secondes (ex: e=43200 = 12h) — sans date de création
-    // on ne peut pas calculer l'expiration → on fait confiance (optimiste)
+    // Durée relative en secondes (ex: s=1787717907 & e=172800 -> expire à s + e)
+    if (sParam) {
+      const startEpoch = parseInt(sParam, 10);
+      if (!isNaN(startEpoch)) {
+        const totalExpiry = startEpoch + expValue;
+        const expired = nowSeconds > totalExpiry;
+        if (expired) {
+          console.warn(`[LinkTTL] Lien signé Vidzy expiré (s=${startEpoch}, e=${expValue}, total=${totalExpiry}, now=${nowSeconds}): ${url.slice(0, 80)}...`);
+        }
+        return expired;
+      }
+    }
+
     return false;
   } catch {
     return false;

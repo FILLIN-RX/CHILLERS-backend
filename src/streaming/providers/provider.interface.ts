@@ -11,6 +11,7 @@ export interface StreamQuery {
   season?: number;
   episode?: number;
   language?: string;
+  isPremium?: boolean;
 }
 
 export interface StreamingProvider {

@@ -6,6 +6,9 @@ import { MongoDBProvider } from './providers/mongodb.provider';
 import { DoodStreamProvider } from './providers/doodstream.provider';
 import { DirectProvider } from './providers/direct.provider';
 import { OtakuProvider } from './providers/otaku.provider';
+import { FrenchStreamProvider } from './providers/frenchstream.provider';
+import { OmniSaveProvider } from './providers/omnisave.provider';
+import { persistDiscoveredStream } from './services/stream-persistence.service';
 import { CachedStream, streamCache, getCacheKey } from '../utils/stream-cache';
 
 const VALIDATION_TIMEOUT = 5000;
@@ -39,6 +42,8 @@ export class ProviderManager {
   private buildProviders(): StreamingProvider[] {
     return [
       new DirectProvider(),
+      new FrenchStreamProvider(),
+      new OmniSaveProvider(),
       new MongoDBProvider(),
       new DoodStreamProvider(),
       new OtakuProvider(),
@@ -47,10 +52,10 @@ export class ProviderManager {
 
   async getMovieStream(query: StreamQuery): Promise<CachedStream | null> {
     // ── Cache LRU ───────────────────────────────────────────────────────────
-    const cacheKey = getCacheKey('movie', query.tmdbId);
+    const cacheKey = getCacheKey('movie', query.tmdbId, undefined, undefined, query.isPremium);
     const cached = streamCache.get(cacheKey);
     if (cached) {
-      console.log(`[Stream] Cache hit for movie ${query.tmdbId}`);
+      console.log(`[Stream] Cache hit for movie ${query.tmdbId} (premium=${!!query.isPremium})`);
       return cached;
     }
 
@@ -79,10 +84,10 @@ export class ProviderManager {
 
   async getEpisodeStream(query: StreamQuery): Promise<CachedStream | null> {
     // ── Cache LRU ───────────────────────────────────────────────────────────
-    const cacheKey = getCacheKey('episode', query.tmdbId, query.season, query.episode);
+    const cacheKey = getCacheKey('episode', query.tmdbId, query.season, query.episode, query.isPremium);
     const cached = streamCache.get(cacheKey);
     if (cached) {
-      console.log(`[Stream] Cache hit for episode ${query.tmdbId} S${query.season}E${query.episode}`);
+      console.log(`[Stream] Cache hit for episode ${query.tmdbId} S${query.season}E${query.episode} (premium=${!!query.isPremium})`);
       return cached;
     }
 
@@ -182,12 +187,16 @@ export class ProviderManager {
         };
       }
 
-      // Skip validation for MongoDB — URLs already stored in our DB,
-      // the provider itself checks signed-link expiry internally.
-      const valid = provider.name === 'mongodb' || await this.validateUrl(result.embedUrl);
+      const valid = await this.validateUrl(result.embedUrl);
       
       if (valid) {
         this.recordSuccess(provider.name);
+        if (provider.name !== 'mongodb') {
+          persistDiscoveredStream(query, result, {
+            quality: provider.name === 'frenchstream' ? '1080p' : '720p',
+            isPremium: query.isPremium || provider.name === 'frenchstream',
+          });
+        }
         return {
           provider: provider.name,
           status: 'success',
@@ -218,18 +227,17 @@ export class ProviderManager {
   }
 
   private sortProviders(query: StreamQuery): StreamingProvider[] {
-    const supports: StreamingProvider[] = [];
-    const fallback: StreamingProvider[] = [];
+    const isPremium = !!query.isPremium;
 
-    for (const p of this.providers) {
-      if (p.supports(query)) {
-        supports.push(p);
-      } else {
-        fallback.push(p);
-      }
+    if (isPremium) {
+      // Pour les utilisateurs Premium : FrenchStream (1080p Full HD) en priorité #1
+      const premiumProviders = this.providers.filter(p => p.name === 'frenchstream' && p.supports(query));
+      const otherProviders = this.providers.filter(p => p.name !== 'frenchstream');
+      return [...premiumProviders, ...otherProviders];
+    } else {
+      // Pour les utilisateurs Standards/Gratuits : flux normaux (Direct, MongoDB, Doodstream, Otaku)
+      return this.providers.filter(p => p.name !== 'frenchstream');
     }
-
-    return [...supports, ...fallback];
   }
 
   private async filterProviders(query: StreamQuery): Promise<StreamingProvider[]> {
@@ -287,7 +295,63 @@ export class ProviderManager {
   }
 
   private async validateUrl(url: string): Promise<boolean> {
-    // Skip validation for iframe embeds since they are protected by Cloudflare/DDOS-GUARD
+    // Skip validation for internal proxy
+    if (url.startsWith('/api/')) {
+      return true;
+    }
+
+    // Validation active pour Uqload
+    if (url.includes('uqload')) {
+      try {
+        const res = await axios.get(url, {
+          timeout: 3000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          },
+          validateStatus: (s) => s === 200,
+        });
+        const html = typeof res.data === 'string' ? res.data : '';
+        if (
+          html.includes('File is no longer available') ||
+          html.includes('expired or has been deleted') ||
+          html.includes('File Not Found') ||
+          (html.includes('deleted') && html.includes('expired'))
+        ) {
+          console.log(`[Stream Validation] Uqload embed is dead/deleted: ${url}`);
+          return false;
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
+    // Validation active pour Doodstream et Streamtape
+    if (url.includes('doodstream') || url.includes('d000d') || url.includes('streamtape')) {
+      try {
+        const res = await axios.get(url, {
+          timeout: 3000,
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+          },
+          validateStatus: (s) => s === 200,
+        });
+        const html = typeof res.data === 'string' ? res.data : '';
+        if (
+          html.includes('Video not found') ||
+          html.includes('File has been deleted') ||
+          html.includes('File has been removed') ||
+          html.includes('404 Not Found')
+        ) {
+          console.log(`[Stream Validation] Dood/Tape embed is dead: ${url}`);
+          return false;
+        }
+        return true;
+      } catch {
+        return false;
+      }
+    }
+
     if (this.isIframeEmbedUrl(url)) {
       return true;
     }

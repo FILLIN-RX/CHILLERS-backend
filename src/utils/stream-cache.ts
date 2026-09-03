@@ -28,9 +28,11 @@ export function getCacheKey(
   tmdbId: number,
   season?: number,
   episode?: number,
+  isPremium?: boolean,
 ): string {
-  if (type === 'movie') return `movie:${tmdbId}`;
-  return `ep:${tmdbId}:${season ?? 0}:${episode ?? 0}`;
+  const tier = isPremium ? 'prem' : 'free';
+  if (type === 'movie') return `movie:${tmdbId}:${tier}`;
+  return `ep:${tmdbId}:${season ?? 0}:${episode ?? 0}:${tier}`;
 }
 
 /** Invalide le cache pour un film/épisode (après re-scrape par ex.). */

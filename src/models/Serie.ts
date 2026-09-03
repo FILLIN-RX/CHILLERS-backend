@@ -15,6 +15,17 @@ export interface IEpisode {
     uqloadLink?: string;
     streamtapeCode?: string;
     streamtapeLink?: string;
+    langueAudio?: string;
+    source?: string;
+    quality?: string;
+    isPremium?: boolean;
+    sources?: Array<{
+        source: string;
+        url: string;
+        quality?: string;
+        isPremium?: boolean;
+        addedAt?: Date;
+    }>;
 }
 
 export interface ISerie extends Document {
@@ -30,6 +41,7 @@ export interface ISerie extends Document {
     speech?: string;
     disponible?: boolean;
     disponibleCheckedAt?: Date;
+    langueAudio?: string;
 }
 
 const EpisodeSchema: Schema = new Schema({
@@ -47,6 +59,22 @@ const EpisodeSchema: Schema = new Schema({
     uqloadLink: { type: String },
     streamtapeCode: { type: String },
     streamtapeLink: { type: String },
+    langueAudio: { type: String },
+    source: { type: String },
+    quality: { type: String },
+    isPremium: { type: Boolean, default: false },
+    sources: {
+        type: [
+            {
+                source: { type: String, required: true },
+                url: { type: String, required: true },
+                quality: { type: String },
+                isPremium: { type: Boolean, default: false },
+                addedAt: { type: Date, default: Date.now },
+            },
+        ],
+        default: [],
+    },
 }, { _id: false });
 
 const SerieSchema: Schema = new Schema({
@@ -60,6 +88,7 @@ const SerieSchema: Schema = new Schema({
     speech: { type: String },
     disponible: { type: Boolean },
     disponibleCheckedAt: { type: Date },
+    langueAudio: { type: String, index: true },
 }, { timestamps: true });
 
 // Index composé pour accélérer le lookup du provider (titre + S/E)

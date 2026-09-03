@@ -7,10 +7,12 @@ export function errMessage(err) {
 const GOOD_INDEXERS_RE = /(yts|eztv|1337x|galaxytv|nyaa|rarbg|therarbg|kickass|torrent9|ygg)/i;
 const BAD_QUALITY_RE = /(\bcam\b|\bts\b|screener|hdtc|hdts|telesync|telecine|subbed\s*telesync)/i;
 const QUALITY_RE = {
-    '2160p': 10,
-    '4k': 10,
+    '2160p': 40,
+    '4k': 40,
     '1080p': 30,
-    '720p': 20,
+    '720p': 10,
+    'hdr': 20,
+    '10bit': 15,
 };
 /**
  * Score un résultat torrent : plus c'est haut, meilleur c'est.
@@ -25,14 +27,21 @@ export function scoreTorrent(item) {
     const seeds = Math.max(0, item.seeders || 0);
     let score = 0;
     score += Math.min(seeds, 500) * 0.2;
-    if (sizeGB >= 0.7 && sizeGB <= 4) {
+    if (sizeGB >= 1.5 && sizeGB <= 8) {
+        // Idéal pour du 1080p ou 4K léger
         score += 50;
     }
-    else if (sizeGB > 0 && sizeGB < 0.7) {
-        score += 15;
+    else if (sizeGB > 8 && sizeGB <= 25) {
+        // Fichiers 4K HDR (assez lourds)
+        score += 40;
     }
-    else if (sizeGB > 4 && sizeGB <= 8) {
+    else if (sizeGB >= 0.5 && sizeGB < 1.5) {
+        // 720p ou 1080p très compressé
         score += 20;
+    }
+    else if (sizeGB > 25) {
+        // Énormes REMUX (risque de gros buffering en streaming)
+        score += 5;
     }
     const title = (item.title || '').toLowerCase();
     if (BAD_QUALITY_RE.test(title))

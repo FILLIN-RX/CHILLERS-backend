@@ -5,4 +5,5 @@ const router = (0, express_1.Router)();
 router.get('/health', torrentsController.healthCheck);
 router.get('/stream', torrentsController.streamFile);
 router.get('/download', torrentsController.downloadFile);
+router.get('/magnet', torrentsController.getMagnets);
 export default router;

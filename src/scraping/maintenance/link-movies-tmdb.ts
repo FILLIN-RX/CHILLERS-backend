@@ -64,14 +64,17 @@ export function stringSimilarity(a: string, b: string): number {
   const union = new Set([...wordsA, ...wordsB]).size;
   const jaccardScore = union > 0 ? intersect / union : 0;
 
-  // 3. Substring inclusion
-  let subScore = 0;
-  if (normA.includes(normB) || normB.includes(normA)) {
-    const minLen = Math.min(normA.length, normB.length);
-    subScore = minLen / maxLen;
+  // 3. Extraction et vérification des chiffres / numéros de suite
+  const numRegex = /\b(\d+|i|ii|iii|iv|v|vi|vii|viii|ix|x)\b/g;
+  const numsA = (normA.match(numRegex) || []).join(' ');
+  const numsB = (normB.match(numRegex) || []).join(' ');
+  let numPenalty = 0;
+  if (numsA !== numsB) {
+    numPenalty = 0.30;
   }
 
-  return Math.max(levScore * 0.5 + jaccardScore * 0.5, subScore, jaccardScore);
+  const baseScore = levScore * 0.5 + jaccardScore * 0.5;
+  return Math.max(0, baseScore - numPenalty);
 }
 
 export function cleanMovieTitle(rawTitle: string): { title: string; year?: number; searchQueries: string[] } {
@@ -98,10 +101,19 @@ export function cleanMovieTitle(rawTitle: string): { title: string; year?: numbe
   const queries = new Set<string>();
   if (cleaned.length > 0) queries.add(cleaned);
 
+  // Titre sans ponctuations (ex: "Saints and Soldiers : L'Honneur des paras" → "Saints and Soldiers L'Honneur des paras")
+  const noPunct = cleaned.replace(/[:–—-]/g, ' ').replace(/\s+/g, ' ').trim();
+  if (noPunct.length > 3 && noPunct !== cleaned) {
+    queries.add(noPunct);
+  }
+
   // Titre principal avant le sous-titre (ex: "Avatar : La Voie de l'eau" → "Avatar")
   const subMatch = cleaned.split(/[:–—-]/);
   if (subMatch.length > 1 && subMatch[0].trim().length >= 3) {
     queries.add(subMatch[0].trim());
+    if (subMatch[1]?.trim().length >= 4) {
+      queries.add(subMatch[1].trim());
+    }
   }
 
   // Titre sans les articles français en début (ex: "Le Parrain" → "Parrain")
@@ -231,8 +243,11 @@ export async function linkMovieTmdb(movieId: string): Promise<{ ok: boolean; tmd
       }
     }
 
-    // Seuil de confiance (>= 0.45)
-    if (bestCandidate && highestScore >= 0.45) {
+    // Seuil de confiance adaptatif : >= 0.70 (ou >= 0.58 si l'année correspond)
+    const hasYearMatch = movie.year && bestCandidate?.release_date && Math.abs(new Date(bestCandidate.release_date).getFullYear() - movie.year) <= 1;
+    const minThreshold = hasYearMatch ? 0.58 : 0.68;
+
+    if (bestCandidate && highestScore >= minThreshold) {
       await Movie.updateOne({ _id: movie._id }, { $set: { tmdbId: bestCandidate.id } });
       console.log(`[TMDB-AUTO] Movie "${movie.titre}" → tmdbId=${bestCandidate.id} ("${bestCandidate.title || bestCandidate.name}", score=${highestScore.toFixed(2)})`);
       return { ok: true, tmdbId: bestCandidate.id };

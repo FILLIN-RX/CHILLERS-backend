@@ -13,7 +13,7 @@ import Admin from '../../models/Admin';
 import Movie from '../../models/Movie';
 import Serie from '../../models/Serie';
 import DeadLink from '../../models/DeadLink';
-import { startCron, stopCron, getCronStatus, runScrapingTasks, runMaintenanceTasks, runner, stopTask, getRunningTasks, runTaskById, runTaskByLabel, listOsProcesses, stopByPid, getSystemCronStatus, ALL_TASKS } from '../../cron-manager';
+import { runner, stopTask, getRunningTasks, runTaskById, runTaskByLabel, listOsProcesses, stopByPid, getSystemCronStatus, ALL_TASKS } from '../../cron-manager';
 import { UqloadClient } from '../uqload/uqload.client';
 import { uploadMoviesBatch, uploadSeriesBatch, uploadSingleMovie, uploadSingleEpisode, stopUpload, isUploadRunning } from '../uqload/uqload.uploader';
 import { autoLink } from '../../scraping/maintenance/auto-link';
@@ -326,7 +326,7 @@ export async function rescrapeDeadLink(req: AuthRequest, res: Response) {
                     const updated = await Movie.findOneAndUpdate(
                         { titre },
                         { $set: { lien: newLink } },
-                        { new: true }
+                        { returnDocument: 'after' }
                     );
                     if (updated) {
                         appendLog(`[Rescrape] ✅ Film mis à jour: ${titre}`);
@@ -382,7 +382,7 @@ export async function updateDeadLink(req: AuthRequest, res: Response) {
             const updated = await Movie.findOneAndUpdate(
                 { titre },
                 { $set: { lien } },
-                { new: true }
+                { returnDocument: 'after' }
             );
             if (!updated) {
                 res.status(404).json({ success: false, data: null, message: 'Film introuvable' });
@@ -490,8 +490,8 @@ export async function linkTmdb(req: AuthRequest, res: Response) {
         }
 
         const updated = type === 'movies'
-            ? await Movie.findByIdAndUpdate(id, { $set: { tmdbId } }, { new: true }).lean()
-            : await Serie.findByIdAndUpdate(id, { $set: { tmdbId } }, { new: true }).lean();
+            ? await Movie.findByIdAndUpdate(id, { $set: { tmdbId } }, { returnDocument: 'after' }).lean()
+            : await Serie.findByIdAndUpdate(id, { $set: { tmdbId } }, { returnDocument: 'after' }).lean();
 
         if (!updated) {
             res.status(404).json({ success: false, data: null, message: 'Document introuvable' });
@@ -528,17 +528,15 @@ export async function fixSeriesSeasons(_req: AuthRequest, res: Response) {
 }
 
 export async function cronStart(_req: AuthRequest, res: Response) {
-    startCron();
-    res.json({ success: true, data: getCronStatus(), message: null });
+    res.json({ success: true, data: { running: false, managedBy: 'github-actions', message: 'Le cron est géré par GitHub Actions. Utilisez le workflow manual pour déclencher les tâches.' }, message: null });
 }
 
 export async function cronStop(_req: AuthRequest, res: Response) {
-    await stopCron();
-    res.json({ success: true, data: getCronStatus(), message: null });
+    res.json({ success: true, data: { running: false, managedBy: 'github-actions', message: 'Le cron est géré par GitHub Actions.' }, message: null });
 }
 
 export async function cronStatus(_req: AuthRequest, res: Response) {
-    res.json({ success: true, data: getCronStatus(), message: null });
+    res.json({ success: true, data: { running: false, managedBy: 'github-actions', message: 'Le cron est géré par GitHub Actions.' }, message: null });
 }
 
 export async function runningTasks(_req: AuthRequest, res: Response) {
@@ -620,7 +618,10 @@ export async function runMaintenance(req: AuthRequest, res: Response) {
     };
 
     if (type === 'all') {
-        runMaintenanceTasks();
+        const maintenanceTasks = ['check-all-links', 'maintenance-liens', 'link-movies-tmdb', 'link-series-tmdb', 'organize-series', 'sync-series-mongo'];
+        for (const taskId of maintenanceTasks) {
+            runTaskById(taskId);
+        }
         res.json({ success: true, data: { status: 'launched', message: 'Toutes les tâches de maintenance lancées' }, message: null });
         return;
     }
@@ -1058,7 +1059,7 @@ export async function scrapperProxyGet(req: AuthRequest, res: Response) {
                     port: process.env.PORT || '4000',
                     mongoUri: process.env.MONGODB_URI ? 'configuré' : 'non configuré',
                     tmdbToken: process.env.TMDB_ACCESS_TOKEN ? 'configuré' : 'non configuré',
-                    cronRunning: getCronStatus().running,
+                    cronRunning: false,
                 },
                 message: null,
             });
@@ -1067,7 +1068,7 @@ export async function scrapperProxyGet(req: AuthRequest, res: Response) {
             return res.json({ success: true, data: getRunningTasks(), message: null });
         }
         if (endpoint === '/cron/status' || endpoint === '/cron/status/') {
-            return res.json({ success: true, data: getCronStatus(), message: null });
+            return res.json({ success: true, data: { running: false, managedBy: 'github-actions' }, message: null });
         }
         if (endpoint === '/scraper-state' || endpoint === '/scraper-state/') {
             const ScraperState = (await import('../../models/ScraperState')).default;
@@ -1109,12 +1110,10 @@ export async function scrapperProxyPost(req: AuthRequest, res: Response) {
     const endpoint = resolveScrapperPath(req);
     try {
         if (endpoint === '/cron/start' || endpoint === '/cron/start/') {
-            startCron();
-            return res.json({ success: true, data: getCronStatus(), message: 'Cron démarré' });
+            return res.json({ success: true, data: { running: false, managedBy: 'github-actions' }, message: 'Le cron est géré par GitHub Actions' });
         }
         if (endpoint === '/cron/stop' || endpoint === '/cron/stop/') {
-            await stopCron();
-            return res.json({ success: true, data: getCronStatus(), message: 'Cron arrêté' });
+            return res.json({ success: true, data: { running: false, managedBy: 'github-actions' }, message: 'Le cron est géré par GitHub Actions' });
         }
         if (endpoint === '/scrape/trigger' || endpoint === '/scrape/trigger/') {
             const type = (req.body?.type as string) || 'all';
@@ -1131,7 +1130,10 @@ export async function scrapperProxyPost(req: AuthRequest, res: Response) {
         }
         if (endpoint === '/maintenance/run' || endpoint === '/maintenance/run/') {
             const type = (req.body?.type as string) || 'all';
-            runMaintenanceTasks();
+            const maintenanceTasks = ['check-all-links', 'maintenance-liens', 'link-movies-tmdb', 'link-series-tmdb', 'organize-series', 'sync-series-mongo'];
+            for (const taskId of maintenanceTasks) {
+                runTaskById(taskId);
+            }
             return res.json({ success: true, data: { status: 'launched', message: `Maintenance ${type} interne lancée` }, message: null });
         }
         if (endpoint.startsWith('/tasks/stop/')) {

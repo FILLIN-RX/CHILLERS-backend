@@ -183,7 +183,7 @@ async function processFilm(item: FsItem): Promise<void> {
                     updatedAt: new Date()
                 }
             },
-            { upsert: true, new: true }
+            { upsert: true, returnDocument: 'after' }
         );
 
         console.log(`[ScrapeFilms] ✅ Film enregistré : ${titre}`);

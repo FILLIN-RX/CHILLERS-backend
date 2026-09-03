@@ -1,4 +1,3 @@
-import cron, { ScheduledTask } from 'node-cron';
 import { spawn, ChildProcess, execSync } from 'child_process';
 import path from 'path';
 import fs from 'fs';
@@ -6,8 +5,6 @@ import { appendLog } from './config/log-buffer';
 
 const isDev = process.env.NODE_ENV !== 'production';
 
-let cronTasks: ScheduledTask[] = [];
-let isRunning = false;
 const runningProcesses: Map<string, ChildProcess> = new Map();
 
 // Répertoire des fichiers PID : <backend>/.runtime/
@@ -307,137 +304,7 @@ export function getSystemCronStatus(): { present: boolean; lines: string[] } {
     }
 }
 
-export function runScrapingTasks() {
-    console.log(`[${new Date().toISOString()}] [Cron] Lancement des tâches de scraping internes...`);
-    runner('Scraping Films', 'scraping/core/scrape-films.ts');
-    runner('Scraping Séries', 'scraping/core/scrape-series.ts');
-    runner('Scraping Animes', 'scraping/core/scrape-animes.ts');
-}
-
-export function runMaintenanceTasks() {
-    console.log(`[${new Date().toISOString()}] [Cron] Lancement des tâches de maintenance internes...`);
-    runner('Vérification Liens Morts', 'scraping/maintenance/check-all-links.ts');
-    runner('Maintenance Liens', 'scraping/maintenance/maintainer.ts');
-    runner('Linking TMDB Films', 'scraping/maintenance/link-movies-tmdb.ts');
-    runner('Linking TMDB Séries', 'scraping/maintenance/link-series-tmdb.ts');
-    runner('Organize Séries Doodstream', 'scraping/maintenance/organize-series.ts');
-    runner('Sync Séries → MongoDB', 'scraping/maintenance/sync-series-to-mongo.ts');
-}
-
-export function runKeepAliveTasks() {
-    console.log(`[${new Date().toISOString()}] [Cron] Lancement du Keep-Alive Uqload...`);
-    runner('KeepAlive Uqload', 'scraping/maintenance/keepalive-uqload.ts');
-}
-
-export function startCron() {
-    if (isRunning) return;
-    cronTasks = [
-        cron.schedule('*/10 * * * *', runMaintenanceTasks),
-        cron.schedule('0 3 * * *', runScrapingTasks),
-        cron.schedule('0 3 * * 0', runKeepAliveTasks), // Chaque dimanche à 03h00 UTC
-    ];
-    isRunning = true;
-    appendLog('[Cron] Tâches planifiées démarrées (10min + scraping 03:00 + KeepAlive dimanche 03:00)');
-    console.log('[Cron] Tâches planifiées démarrées.');
-
-    // Scraping automatique au démarrage supprimé : contrôlé manuellement par l'admin.
-}
-
-export async function stopCron() {
-    if (!isRunning) return;
-    cronTasks.forEach(t => t.stop());
-    cronTasks = [];
-    isRunning = false;
-    // Graceful kill de toutes les tâches en cours
-    const entries = Array.from(runningProcesses.entries());
-    await Promise.all(entries.map(async ([name, child]) => {
-        if (child.pid) {
-            await killTree(child);
-        }
-        runningProcesses.delete(name);
-    }));
-    appendLog('[Cron] Tâches planifiées arrêtées');
-    console.log('[Cron] Tâches planifiées arrêtées.');
-}
-
-export function getCronStatus() {
-    return { running: isRunning, tasks: cronTasks.length };
-}
-
-// ── Tâches de déploiement (exécutées une fois par déploiement) ──────────────
-const DEPLOY_LOCK = path.join(RUNTIME_DIR, 'deploy-uqload.done');
-
-/** Résout un script (dist .js en prod, src .ts en dev) sous dist|src/scripts/. */
-function resolveDeployScript(base: string): { cmd: string; args: string[] } | null {
-    const tsPath = path.join(__dirname, 'scripts', `${base}.ts`);
-    const jsPath = path.join(__dirname, 'scripts', `${base}.js`);
-    if (fs.existsSync(tsPath)) return { cmd: 'npx', args: ['tsx', tsPath] };
-    if (fs.existsSync(jsPath)) return { cmd: 'node', args: [jsPath] };
-    return null;
-}
-
-/** Spawn synchrone-attendable d'un script one-shot ; log stdout/stderr. */
-function spawnOnce(name: string, cmd: string, args: string[]): Promise<number> {
-    return new Promise((resolve) => {
-        const child = spawn(cmd, args, { stdio: ['ignore', 'pipe', 'pipe'] });
-        child.stdout?.on('data', (data) => {
-            for (const line of data.toString().split('\n').filter((l: string) => l)) {
-                const msg = `[${name}] ${line}`;
-                console.log(msg);
-                appendLog(msg);
-            }
-        });
-        child.stderr?.on('data', (data) => {
-            for (const line of data.toString().split('\n').filter((l: string) => l)) {
-                const msg = `[${name}] ${line}`;
-                console.error(msg);
-                appendLog(msg);
-            }
-        });
-        child.on('close', (code) => resolve(code ?? -1));
-        child.on('error', (err) => {
-            appendLog(`[${name}] erreur de lancement : ${err.message}`);
-            resolve(-1);
-        });
-    });
-}
-
 /**
- * Migration DoodStream → Uqload lancée UNE fois par déploiement, en arrière-plan
- * (ne bloque pas le démarrage du serveur) :
- *   1. migrate-dood-to-uqload  (upload distant → remplit uqloadCode)
- *   2. upload-uqload --verify  (résout les liens directs quand le fichier est prêt)
- *
- * - Désactivable via RUN_UQLOAD_MIGRATION_ON_DEPLOY=false.
- * - Ignorée si UQLOAD_API_KEY absente.
- * - Un fichier verrou dans .runtime/ garantit "une fois par déploiement"
- *   (le disque Render est recréé à chaque déploiement, mais un simple restart
- *   du process ne relance donc pas la migration).
+ * Le cron automatique est désormais géré par GitHub Actions.
+ * Ces fonctions restent disponibles pour l'admin panel (déclenchement manuel).
  */
-export async function runDeployTasksOnce(): Promise<void> {
-    if (process.env.RUN_UQLOAD_MIGRATION_ON_DEPLOY === 'false') {
-        console.log('[Deploy] Migration Uqload désactivée (RUN_UQLOAD_MIGRATION_ON_DEPLOY=false).');
-        return;
-    }
-    if (!process.env.UQLOAD_API_KEY) {
-        console.log('[Deploy] UQLOAD_API_KEY absente → migration Uqload ignorée.');
-        return;
-    }
-    if (fs.existsSync(DEPLOY_LOCK)) {
-        console.log('[Deploy] Migration Uqload déjà exécutée pour ce déploiement.');
-        return;
-    }
-    try { fs.writeFileSync(DEPLOY_LOCK, new Date().toISOString(), 'utf8'); } catch { /* best effort */ }
-
-    const migrate = resolveDeployScript('migrate-dood-to-uqload');
-    const upload = resolveDeployScript('upload-uqload');
-    if (!migrate || !upload) {
-        appendLog('[Deploy] Scripts Uqload introuvables → migration ignorée.');
-        return;
-    }
-
-    appendLog('[Deploy] Migration DoodStream → Uqload (une fois)…');
-    await spawnOnce('deploy-migrate-uqload', migrate.cmd, migrate.args);
-    await spawnOnce('deploy-verify-uqload', upload.cmd, [...upload.args, '--verify']);
-    appendLog('[Deploy] Migration Uqload terminée.');
-}

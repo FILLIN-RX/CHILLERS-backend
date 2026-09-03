@@ -3,6 +3,12 @@ import axios_1 from "axios";
 import * as child_process_1 from "child_process";
 import * as config_1 from "./config";
 import * as torrents_utils_1 from "./torrents.utils";
+import jwt from 'jsonwebtoken';
+import { User } from '../../models/User';
+import { SubscriptionPlan } from '../../models/SubscriptionPlan';
+
+const JWT_SECRET = process.env.JWT_SECRET || 'chillers-super-secret-key-change-me';
+
 export async function healthCheck(_req, res) {
     if (!(0, config_1.isTorrentsConfigured)()) {
         res.json({
@@ -141,5 +147,83 @@ export async function downloadFile(req, res) {
         console.error(`[Torrents][Download] Erreur: ${(0, torrents_utils_1.errMessage)(err)}`);
         if (!res.headersSent)
             res.status(500).send('Échec du téléchargement.');
+    }
+}
+
+import { searchTorrents } from './prowlarr.service';
+import { QUALITY_RE } from './torrents.utils';
+
+export async function getMagnets(req: any, res: any) {
+    const { title, year, type, season, episode } = req.query;
+    if (!title) {
+        res.status(400).send('Title required');
+        return;
+    }
+    const opts = {
+        title,
+        year: year ? parseInt(year, 10) : undefined,
+        type,
+        season: season ? parseInt(season, 10) : undefined,
+        episode: episode ? parseInt(episode, 10) : undefined,
+        limit: 20
+    };
+    try {
+        const results = await searchTorrents(opts);
+        if (!results || results.length === 0) {
+            res.json({ success: true, data: [] });
+            return;
+        }
+
+        let maxResolution = '720p';
+        try {
+            const token = req.headers.authorization?.split(' ')[1];
+            if (token) {
+                const decoded: any = jwt.verify(token, JWT_SECRET);
+                const user = await User.findById(decoded.id);
+                if (user) {
+                    const planCode = user.subscription?.plan || 'free';
+                    const planDoc = await SubscriptionPlan.findOne({ code: planCode });
+                    if (planDoc?.features?.maxResolution) maxResolution = planDoc.features.maxResolution;
+                }
+            }
+        } catch(e) {}
+
+        // Group by quality (4K, 1080p, 720p)
+        const sources = [];
+        let has4k = false;
+        let has1080p = false;
+
+        for (const item of results) {
+            let quality = '720p';
+            if (QUALITY_RE.test(item.title) || item.size > 8 * 1024 ** 3) {
+                quality = '4K';
+            } else if (/1080p/i.test(item.title) || item.size > 2 * 1024 ** 3) {
+                quality = '1080p';
+            }
+            
+            if (quality === '4K' && maxResolution !== '4K') continue;
+            if (quality === '1080p' && maxResolution === '720p') continue;
+
+            if (quality === '4K' && !has4k) {
+                sources.push({ quality: '4K', magnet: item.magnet, infoHash: item.infoHash, size: item.size });
+                has4k = true;
+            } else if (quality === '1080p' && !has1080p) {
+                sources.push({ quality: '1080p', magnet: item.magnet, infoHash: item.infoHash, size: item.size });
+                has1080p = true;
+            } else if (quality === '720p' && sources.findIndex(s => s.quality === '720p') === -1) {
+                sources.push({ quality: '720p', magnet: item.magnet, infoHash: item.infoHash, size: item.size });
+            }
+
+            if (has4k && has1080p) break;
+        }
+
+        // Fallback to first if neither 4K nor 1080p found
+        if (sources.length === 0 && results.length > 0) {
+            sources.push({ quality: 'Default', magnet: results[0].magnet, infoHash: results[0].infoHash, size: results[0].size });
+        }
+
+        res.json({ success: true, data: sources });
+    } catch (err: any) {
+        res.status(500).json({ success: false, message: err.message });
     }
 }

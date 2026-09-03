@@ -56,6 +56,31 @@ async function isUrlAlive(url: string): Promise<boolean> {
   }
 }
 
+async function isUqloadAlive(code: string): Promise<boolean> {
+  if (!code) return false;
+  try {
+    const res = await axios.get(`https://uqload.is/embed-${code}.html`, {
+      timeout: 3000,
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      },
+      validateStatus: (s) => s === 200,
+    });
+    const html = typeof res.data === 'string' ? res.data : '';
+    if (
+      html.includes('File is no longer available') ||
+      html.includes('expired or has been deleted') ||
+      html.includes('File Not Found') ||
+      (html.includes('deleted') && html.includes('expired'))
+    ) {
+      return false;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export class MongoDBProvider implements StreamingProvider {
   readonly name = 'mongodb';
 
@@ -74,20 +99,50 @@ export class MongoDBProvider implements StreamingProvider {
       }
       if (!movie) return null;
 
-      // 1. Priorité au lien direct direct (Vidzy/MP4 OpenOtaku) s'il est actif
-      const directUrl = resolveUrl(movie.lien);
-      if (directUrl && await isUrlAlive(directUrl)) {
-        return { provider: this.name, embedUrl: toEmbedUrl(directUrl), type: 'movie' };
+      // 0. Si le film a des sources multiples enregistrées
+      if (movie.sources && movie.sources.length > 0) {
+        // Pour les utilisateurs Premium, prioriser les sources 1080p ou marquées isPremium
+        const sortedSources = [...movie.sources].sort((a, b) => {
+          if (query.isPremium) {
+            const scoreA = (a.quality === '1080p' ? 2 : 0) + (a.isPremium ? 1 : 0);
+            const scoreB = (b.quality === '1080p' ? 2 : 0) + (b.isPremium ? 1 : 0);
+            return scoreB - scoreA;
+          }
+          return 0;
+        });
+
+        for (const s of sortedSources) {
+          const u = resolveUrl(s.url);
+          if (u && await isUrlAlive(u)) {
+            return {
+              provider: s.source || this.name,
+              embedUrl: toEmbedUrl(u),
+              type: 'movie'
+            };
+          }
+        }
       }
 
-      // 2. Fallback Uqload
+      // 1. Priorité au lien direct (Vidzy/MP4 OpenOtaku) s'il est actif
+      const directUrl = resolveUrl(movie.lien);
+      if (directUrl && await isUrlAlive(directUrl)) {
+        return { provider: movie.source || this.name, embedUrl: toEmbedUrl(directUrl), type: 'movie' };
+      }
+
+      // 2. Fallback Uqload (vérification active de la disponibilité du fichier)
       if (movie.uqloadCode) {
-        return { provider: this.name, embedUrl: uqloadEmbedUrl(movie.uqloadCode), type: 'movie' };
+        const alive = await isUqloadAlive(movie.uqloadCode);
+        if (alive) {
+          return { provider: 'uqload', embedUrl: uqloadEmbedUrl(movie.uqloadCode), type: 'movie' };
+        } else {
+          console.log(`[MongoDB] Uqload code ${movie.uqloadCode} est expiré/mort pour "${movie.titre}" → suppression et passage aux autres sources`);
+          Movie.updateOne({ _id: movie._id }, { $unset: { uqloadCode: 1, uqloadLink: 1 } }).exec().catch(() => {});
+        }
       }
 
       // 3. Fallback Streamtape
       if ((movie as any).streamtapeCode) {
-        return { provider: this.name, embedUrl: `https://streamtape.com/e/${(movie as any).streamtapeCode}`, type: 'movie' };
+        return { provider: 'streamtape', embedUrl: `https://streamtape.com/e/${(movie as any).streamtapeCode}`, type: 'movie' };
       }
 
       // 4. Fallback lien secondaire
@@ -128,25 +183,53 @@ export class MongoDBProvider implements StreamingProvider {
 
       if (!ep) return null;
 
+      // 0. Si l'épisode a des sources multiples enregistrées
+      if (ep.sources && ep.sources.length > 0) {
+        const sortedSources = [...ep.sources].sort((a, b) => {
+          if (query.isPremium) {
+            const scoreA = (a.quality === '1080p' ? 2 : 0) + (a.isPremium ? 1 : 0);
+            const scoreB = (b.quality === '1080p' ? 2 : 0) + (b.isPremium ? 1 : 0);
+            return scoreB - scoreA;
+          }
+          return 0;
+        });
+
+        for (const s of sortedSources) {
+          const u = resolveUrl(s.url);
+          if (u && await isUrlAlive(u)) {
+            return {
+              provider: s.source || this.name,
+              embedUrl: toEmbedUrl(u),
+              type: 'episode'
+            };
+          }
+        }
+      }
+
       // 1. Priorité au lien direct (Vidzy/MP4) s'il est actif
       const directUrl = resolveUrl(ep.lien);
       if (directUrl && await isUrlAlive(directUrl)) {
-        return { provider: this.name, embedUrl: toEmbedUrl(directUrl), type: 'episode' };
+        return { provider: ep.source || this.name, embedUrl: toEmbedUrl(directUrl), type: 'episode' };
       }
 
-      // 2. Fallback Uqload
+      // 2. Fallback Uqload (vérification active)
       if (ep.uqloadCode) {
-        return { provider: this.name, embedUrl: uqloadEmbedUrl(ep.uqloadCode), type: 'episode' };
+        const alive = await isUqloadAlive(ep.uqloadCode);
+        if (alive) {
+          return { provider: 'uqload', embedUrl: uqloadEmbedUrl(ep.uqloadCode), type: 'episode' };
+        } else {
+          console.log(`[MongoDB] Uqload code ${ep.uqloadCode} est expiré/mort pour S${query.season}E${query.episode} de "${serie.titre}" → suppression`);
+        }
       }
 
       // 3. Fallback Streamtape
       if ((ep as any).streamtapeCode) {
-        return { provider: this.name, embedUrl: `https://streamtape.com/e/${(ep as any).streamtapeCode}`, type: 'episode' };
+        return { provider: 'streamtape', embedUrl: `https://streamtape.com/e/${(ep as any).streamtapeCode}`, type: 'episode' };
       }
 
       // 4. Fallback uqloadLink
       if (ep.uqloadLink && await isUrlAlive(ep.uqloadLink)) {
-        return { provider: this.name, embedUrl: toEmbedUrl(ep.uqloadLink), type: 'episode' };
+        return { provider: 'uqload', embedUrl: toEmbedUrl(ep.uqloadLink), type: 'episode' };
       }
 
       console.log(`[MongoDB] Aucun lien valide pour S${query.season}E${query.episode} de "${serie.titre}" → fallback providers`);
