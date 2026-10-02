@@ -2,7 +2,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 dotenv.config({ path: path.join(__dirname, '../../.env') });
 
-import { DoodStreamProvider } from '../../streaming/providers/doodstream.provider';
+import { DoodStreamProvider } from '../../modules/streaming/providers/doodstream.provider';
 
 async function main() {
   const provider = new DoodStreamProvider();

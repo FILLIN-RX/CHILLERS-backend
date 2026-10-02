@@ -1,59 +1,22 @@
-import axios from 'axios';
+import { chromium, Browser, Page } from 'playwright';
+import { browserConfig } from '../../config/browser';
 import Movie from '../../models/Movie';
 import Serie from '../../models/Serie';
 
 const BASE_URL = 'https://www.open-otaku.me';
 
+let browser: Browser | null = null;
 let scrapeInProgress = false;
+
+async function getBrowser(): Promise<Browser> {
+  if (!browser || !browser.isConnected()) {
+    browser = await chromium.launch(browserConfig);
+  }
+  return browser;
+}
 
 function normalize(str: string): string {
   return str.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20);
-}
-
-function toDownloadUrl(url: string): string {
-  if (!url) return '';
-  if (url.includes('vidzy.')) return url.replace('/embed-', '/d/').replace('.html', '_n.html');
-  if (url.includes('luluvid.')) return url.replace('/embed-', '/d/').replace('.html', '');
-  return url;
-}
-
-async function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function fetchWithRetry(url: string, params: any, retries = 3, delayMs = 3000): Promise<any> {
-  for (let attempt = 1; attempt <= retries; attempt++) {
-    try {
-      const { data } = await axios.get(url, {
-        params,
-        timeout: 20000,
-        headers: { 'User-Agent': 'Mozilla/5.0' },
-      });
-      return data;
-    } catch (err: any) {
-      const is429 = err?.response?.status === 429 || err?.message?.includes('429');
-      if (is429 && attempt < retries) {
-        const wait = delayMs * attempt;
-        console.log(`[Otaku Service] [429 RateLimit] Pause ${wait / 1000}s avant retry...`);
-        await sleep(wait);
-        continue;
-      }
-      if (attempt === retries) throw err;
-      await sleep(1000 * attempt);
-    }
-  }
-  return null;
-}
-
-async function getDirectLink(embedUrl: string): Promise<string | null> {
-  try {
-    const dlUrl = toDownloadUrl(embedUrl);
-    if (!dlUrl) return null;
-    const data = await fetchWithRetry(`${BASE_URL}/api/dl`, { url: dlUrl });
-    return data?.success && data?.downloadUrl ? data.downloadUrl : null;
-  } catch {
-    return null;
-  }
 }
 
 export interface OtakuResult {
@@ -63,135 +26,307 @@ export interface OtakuResult {
 }
 
 export async function searchOtaku(title: string, type: 'movie' | 'series' = 'movie'): Promise<OtakuResult | null> {
-  try {
-    console.log(`[Otaku Direct API] Searching "${title}" (type: ${type})`);
-    
-    // 1. Recherche directe via l'API interne d'OpenOtaku
-    const data = await fetchWithRetry(`${BASE_URL}/api/fs-search`, { q: title });
+  const b = await getBrowser();
+  const page = await b.newPage();
 
-    const results: Array<{ id: string; title: string; poster?: string }> = data?.results || [];
-    if (results.length === 0) {
-      console.log(`[Otaku] Aucun résultat trouvé pour "${title}"`);
+  try {
+    // Navigate to search page
+    const searchUrl = type === 'series'
+      ? `${BASE_URL}/?cat=series`
+      : `${BASE_URL}/`;
+
+    console.log(`[Otaku] Searching "${title}" on ${searchUrl}`);
+    await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2000);
+
+    // Click search button
+    const searchBtn = page.locator('#fs-search-icon-btn');
+    if (await searchBtn.count() > 0) {
+      await searchBtn.click();
+      await page.waitForTimeout(1000);
+    }
+
+    // Type in search input
+    const searchInput = page.locator('input[type="search"], input[type="text"], #fs-search-input, .fs-search-input');
+    if (await searchInput.count() > 0) {
+      await searchInput.first().fill(title);
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(3000);
+    } else {
+      // Try URL-based search
+      await page.goto(`${BASE_URL}/?s=${encodeURIComponent(title)}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.waitForTimeout(3000);
+    }
+
+    // Find cards in results
+    const cards = await page.locator('.fs-card').all();
+    if (cards.length === 0) {
+      console.log(`[Otaku] No results for "${title}"`);
       return null;
     }
 
-    // 2. Trouver la meilleure correspondance de titre
-    let bestItem = results[0];
+    // Find best match
+    let bestCard = cards[0];
     let bestScore = 0;
     const searchNorm = normalize(title);
 
-    for (const item of results) {
-      const itemNorm = normalize(item.title || '');
-      if (itemNorm === searchNorm || itemNorm.includes(searchNorm) || searchNorm.includes(itemNorm)) {
-        bestItem = item;
+    for (const card of cards) {
+      const cardTitle = await card.locator('.fs-card-title').innerText().catch(() => '');
+      const cardNorm = normalize(cardTitle);
+      if (cardNorm === searchNorm || cardNorm.includes(searchNorm) || searchNorm.includes(cardNorm)) {
+        bestCard = card;
         bestScore = 1;
         break;
       }
-      if (itemNorm.slice(0, 10) === searchNorm.slice(0, 10)) {
-        bestItem = item;
+      // Partial match
+      if (cardNorm.slice(0, 10) === searchNorm.slice(0, 10)) {
+        bestCard = card;
         bestScore = 0.5;
       }
     }
 
     if (bestScore === 0) {
-      console.log(`[Otaku] Pas de correspondance exacte pour "${title}", premier résultat utilisé : ${bestItem.title}`);
+      console.log(`[Otaku] No close match for "${title}", using first result`);
     }
 
-    // 3. Récupérer les détails de visionnage (players / épisodes)
-    const watch = await fetchWithRetry(`${BASE_URL}/api/fs-watch`, { id: bestItem.id });
+    // Supprimer la popup don qui bloque le clic
+    await page.evaluate(() => {
+        document.querySelector('#fs-donate-overlay')?.remove();
+    }).catch(() => {});
 
-    const detailTitle = watch?.meta?.title || bestItem.title || title;
+    await page.waitForTimeout(500);
+    // Supprimer la popup don à nouveau (elle peut réapparaître)
+    await page.evaluate(() => {
+        document.querySelector('#fs-donate-overlay')?.remove();
+    }).catch(() => {});
+
+    // Click on best card (force: true pour ignorer les overlays)
+    await bestCard.click({ force: true });
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForTimeout(2000);
+
+    // Get title from detail page
+    const detailTitle = await page.locator('.fs-card-title, h1, h2').first().innerText().catch(() => title);
 
     if (type === 'series') {
-      const rawEps = watch?.episodes || {};
-      const vfMap = rawEps.vf || {};
-      const vostfrMap = rawEps.vostfr || {};
-      const version = Object.keys(vfMap).length > 0 ? vfMap : vostfrMap;
-      const firstEpKey = Object.keys(version)[0] || '1';
-      const players = version[firstEpKey] || {};
-      const embedUrl = players.vidzy || players.luluvid || (Object.values(players)[0] as string) || '';
-      
-      if (embedUrl) {
-        const link = await getDirectLink(embedUrl);
-        if (link) {
-          return { titre: detailTitle, lien: link, source: 'otaku' };
-        }
+      // Series: get first episode download link
+      const link = await extractEpisodeDownload(page);
+      if (link) {
+        return { titre: detailTitle, lien: link, source: 'otaku' };
       }
     } else {
-      const players = watch?.players || {};
-      const embedUrl =
-        players.vidzy?.default ||
-        players.vidzy?.vff ||
-        players.vidzy?.vf ||
-        players.vidzy?.vostfr ||
-        players.premium?.default ||
-        (Object.values(players)[0] as any)?.default ||
-        '';
-
-      if (embedUrl) {
-        const link = await getDirectLink(embedUrl);
-        if (link) {
-          return { titre: detailTitle, lien: link, source: 'otaku' };
-        }
+      // Movie: get download link
+      const link = await extractMovieDownload(page);
+      if (link) {
+        return { titre: detailTitle, lien: link, source: 'otaku' };
       }
     }
 
-    console.log(`[Otaku] Lien direct non trouvé pour "${title}"`);
+    console.log(`[Otaku] No download link found for "${title}"`);
     return null;
   } catch (err: any) {
-    console.error(`[Otaku] Erreur recherche API pour "${title}":`, err.message);
+    console.error(`[Otaku] Error searching "${title}":`, err.message);
     return null;
+  } finally {
+    await page.close();
   }
 }
 
-export async function getSpecificEpisodeLink(
-  page: any,
-  episodeNumber: string,
-  previousLink?: string | null,
-  seriesIdOrTitle?: string
-): Promise<string | null> {
+async function extractMovieDownload(page: Page): Promise<string | null> {
   try {
-    const targetTitle = seriesIdOrTitle || (page?.url ? new URL(page.url()).searchParams.get('watch_fs') : null);
-    if (!targetTitle) return null;
+    // Click download button
+    const dlBtn = page.locator('button#fs-quick-download, .fs-download-btn, button:has-text("Download")');
+    if (await dlBtn.count() > 0) {
+      await dlBtn.first().click({ force: true });
+      await page.waitForTimeout(8000);
 
-    let fsId = targetTitle;
-    if (isNaN(Number(targetTitle))) {
-      const { data } = await axios.get(`${BASE_URL}/api/fs-search`, {
-        params: { q: targetTitle },
-        timeout: 10000,
-        headers: { 'User-Agent': 'Mozilla/5.0' }
-      });
-      fsId = data?.results?.[0]?.id;
+      // Extract link
+      const dlLink = page.locator('a#fs-dl-link, a[href*="vidzy"], a[href*="doodstream"], a[href*=".mp4"]');
+      if (await dlLink.count() > 0) {
+        const href = await dlLink.first().getAttribute('href');
+        if (href && href !== '#') return href;
+      }
     }
 
-    if (!fsId) return null;
-
-    const { data: watch } = await axios.get(`${BASE_URL}/api/fs-watch`, {
-      params: { id: fsId },
-      timeout: 10000,
-      headers: { 'User-Agent': 'Mozilla/5.0' }
-    });
-
-    const rawEps = watch?.episodes || {};
-    const vfMap = rawEps.vf || {};
-    const vostfrMap = rawEps.vostfr || {};
-    const version = Object.keys(vfMap).length > 0 ? vfMap : vostfrMap;
-    const epNumOnly = episodeNumber.replace(/\D/g, '') || '1';
-    const players = version[epNumOnly] || Object.values(version)[0] || {};
-    const embedUrl = (players as any).vidzy || (players as any).luluvid || (Object.values(players)[0] as string) || '';
-
-    if (embedUrl) {
-      return await getDirectLink(embedUrl);
+    // Fallback: try to find any direct link
+    const allLinks = await page.locator('a[href]').all();
+    for (const link of allLinks) {
+      const href = await link.getAttribute('href');
+      if (href && (href.includes('.mp4') || href.includes('vidzy') || href.includes('doodstream'))) {
+        return href;
+      }
     }
+
     return null;
-  } catch (err: any) {
-    console.error(`[Otaku] Erreur getSpecificEpisodeLink:`, err.message);
+  } catch {
     return null;
   }
 }
 
-export async function searchAndNavigateToSeries(page: any, title: string): Promise<boolean> {
-  return true;
+async function extractEpisodeDownload(page: Page): Promise<string | null> {
+  try {
+    // Click download button
+    const dlBtn = page.locator('button#fs-quick-download, .fs-download-btn');
+    if (await dlBtn.count() > 0) {
+      await dlBtn.first().click({ force: true });
+      await page.waitForTimeout(8000);
+
+      // Extract link
+      const dlLink = page.locator('a#fs-dl-link, a[href*="vidzy"], a[href*="doodstream"], a[href*=".mp4"]');
+      if (await dlLink.count() > 0) {
+        const href = await dlLink.first().getAttribute('href');
+        if (href && href !== '#') return href;
+      }
+    }
+
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export async function searchAndNavigateToSeries(page: Page, title: string): Promise<boolean> {
+  try {
+    console.log(`[Otaku] Navigating to series: "${title}" via UI search`);
+
+    // 1. Go to homepage
+    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForTimeout(2000);
+
+    // 2. Click search button
+    const searchBtn = page.locator('#fs-search-icon-btn');
+    if (await searchBtn.count() > 0) {
+      await searchBtn.click();
+      await page.waitForTimeout(1000);
+    }
+
+    // 3. Type in search input and press Enter
+    const searchInput = page.locator('input[type="search"], input[type="text"], #fs-search-input, .fs-search-input');
+    if (await searchInput.count() > 0) {
+      await searchInput.first().fill(title);
+      await page.keyboard.press('Enter');
+      await page.waitForTimeout(4000); // Wait for results
+    } else {
+        console.log("[Otaku] Search input not found");
+        return false;
+    }
+
+    // 4. Find cards and click best match
+    const cards = await page.locator('.fs-card').all();
+    if (cards.length === 0) {
+      console.log(`[Otaku] No results for "${title}"`);
+      return false;
+    }
+
+    // Simple matching to find the best card
+    let targetCard = cards[0];
+    for (const card of cards) {
+      const cardTitle = await card.locator('.fs-card-title').innerText().catch(() => '');
+      if (cardTitle.toLowerCase().includes(title.toLowerCase())) {
+        targetCard = card;
+        break;
+      }
+    }
+
+    await targetCard.click();
+    await page.waitForLoadState('domcontentloaded');
+    await page.waitForTimeout(2000);
+
+    return true;
+  } catch (err) {
+    console.error(`[Otaku] Error navigating to "${title}":`, err);
+    return false;
+  }
+}
+
+export async function getSpecificEpisodeLink(page: Page, episodeNumber: string, previousLink?: string | null): Promise<string | null> {
+  const maxRetries = 2;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // 1. Attendre que le select ait au moins une option
+      await page.waitForFunction(() => {
+        const s = document.querySelector('#fs-episode-select') as HTMLSelectElement;
+        return s && s.options && s.options.length > 0;
+      }, { timeout: 15000 });
+
+      // 2. Sélectionner l'épisode dans la liste
+      const optionFound = await page.evaluate((epNum) => {
+          const select = document.querySelector('#fs-episode-select') as HTMLSelectElement;
+          const option = Array.from(select.options).find(o => o.text.trim().includes('Ép ' + epNum));
+          if (option) {
+              select.value = option.value;
+              select.dispatchEvent(new Event('change'));
+              return true;
+          }
+          return false;
+      }, episodeNumber);
+
+      if (!optionFound) {
+        const texts = await page.evaluate(() => {
+          const s = document.querySelector('#fs-episode-select') as HTMLSelectElement | null;
+          return s ? Array.from(s.options, o => o.text) : [];
+        });
+        console.log(`[Otaku] Épisode "${episodeNumber}" non trouvé. Options: ${JSON.stringify(texts)}`);
+        return null;
+      }
+
+      // 3. Attendre que le contenu se mette à jour
+      await page.waitForTimeout(3000);
+
+      // 4. Cliquer sur téléchargement
+      const dlBtn = page.locator('button#fs-quick-download, .fs-download-btn, button:has-text("Download")');
+      if (await dlBtn.count() > 0) {
+          await dlBtn.first().click({ force: true });
+      } else {
+          console.log("[Otaku] Bouton de téléchargement introuvable.");
+          if (attempt < maxRetries) {
+            await page.reload({ waitUntil: 'domcontentloaded' });
+            await page.waitForTimeout(2000);
+            continue;
+          }
+          return null;
+      }
+
+      // 5. Attendre un lien valide ET différent du précédent (évite les liens périmés)
+      try {
+        await page.waitForFunction((prevLink) => {
+            const a = document.querySelector('a#fs-dl-link, a[href*="vidzy"], a[href*="doodstream"]');
+            if (!a) return false;
+            const href = a.getAttribute('href');
+            return href !== null && href !== '#' && href.length > 10 && href !== prevLink;
+        }, previousLink ?? null, { timeout: 30000 });
+      } catch {
+        console.log(`[Otaku] Timeout en attente du lien pour épisode ${episodeNumber}`);
+        if (attempt < maxRetries) {
+          await page.reload({ waitUntil: 'domcontentloaded' });
+          await page.waitForTimeout(2000);
+          continue;
+        }
+        return null;
+      }
+
+      // 6. Récupérer le lien
+      const dlLink = page.locator('a#fs-dl-link, a[href*="vidzy"], a[href*="doodstream"]');
+      if (await dlLink.count() > 0) {
+          const href = await dlLink.first().getAttribute('href');
+          if (href && href !== '#') return href;
+      }
+
+      if (attempt < maxRetries) {
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(2000);
+      }
+    } catch (err) {
+      console.error(`[Otaku] Erreur (tentative ${attempt}) pour épisode ${episodeNumber}:`, err);
+      if (attempt < maxRetries) {
+        await page.reload({ waitUntil: 'domcontentloaded' });
+        await page.waitForTimeout(2000);
+        continue;
+      }
+    }
+  }
+  return null;
 }
 
 export async function searchAndCache(
@@ -199,7 +334,7 @@ export async function searchAndCache(
   type: 'movie' | 'series' = 'movie'
 ): Promise<OtakuResult | null> {
   if (scrapeInProgress) {
-    console.log(`[Otaku] Scrape déjà en cours, skip "${title}"`);
+    console.log(`[Otaku] Scrape already in progress, skipping "${title}"`);
     return null;
   }
 
@@ -212,20 +347,20 @@ export async function searchAndCache(
         if (!existing) {
           await Serie.create({
             titre: result.titre,
-            pageUrl: '',
+            pageUrl: '', // Will be filled by maintenance
             episodes: [{ episode: 'Ép 1', lien: result.lien }]
           });
-          console.log(`[Otaku] Série mise en cache : ${result.titre}`);
+          console.log(`[Otaku] Cached Series: ${result.titre}`);
         }
       } else {
         const existing = await Movie.findOne({ titre: result.titre });
         if (!existing) {
           await Movie.create({
             titre: result.titre,
-            pageUrl: '',
+            pageUrl: '', // Will be filled by maintenance
             lien: result.lien
           });
-          console.log(`[Otaku] Film mis en cache : ${result.titre}`);
+          console.log(`[Otaku] Cached Movie: ${result.titre}`);
         }
       }
     }
@@ -234,4 +369,3 @@ export async function searchAndCache(
     scrapeInProgress = false;
   }
 }
-

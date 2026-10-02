@@ -21,17 +21,6 @@ export interface IMovie extends Document {
   speech?: string;
   disponible?: boolean;
   disponibleCheckedAt?: Date;
-  langueAudio?: string;
-  source?: string;
-  quality?: string;
-  isPremium?: boolean;
-  sources?: Array<{
-    source: string;
-    url: string;
-    quality?: string;
-    isPremium?: boolean;
-    addedAt?: Date;
-  }>;
 }
 
 const MovieSchema: Schema = new Schema({
@@ -39,7 +28,7 @@ const MovieSchema: Schema = new Schema({
   pageUrl: { type: String, required: true },
   lien: { type: String, required: true },
   lienOriginal: { type: String },
-  tmdbId: { type: Number, index: true },
+  tmdbId: { type: Number },
   createdAt: { type: Date, default: Date.now },
   uqloadCode: { type: String, index: true, sparse: true },
   uqloadLink: { type: String },
@@ -55,22 +44,6 @@ const MovieSchema: Schema = new Schema({
   speech: { type: String },
   disponible: { type: Boolean },
   disponibleCheckedAt: { type: Date },
-  langueAudio: { type: String, index: true },
-  source: { type: String, index: true },
-  quality: { type: String },
-  isPremium: { type: Boolean, default: false },
-  sources: {
-    type: [
-      {
-        source: { type: String, required: true },
-        url: { type: String, required: true },
-        quality: { type: String },
-        isPremium: { type: Boolean, default: false },
-        addedAt: { type: Date, default: Date.now },
-      },
-    ],
-    default: [],
-  },
 });
 
 export default mongoose.model<IMovie>('Movie', MovieSchema);

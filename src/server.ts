@@ -1,9 +1,9 @@
 import './config/env';
 import app from './app';
 import { connectDB } from './config/db';
+import { startCron, runDeployTasksOnce } from './cron-manager';
 import bcrypt from 'bcryptjs';
 import Admin from './models/Admin';
-import { SubscriptionPlan } from './models/SubscriptionPlan';
 
 const PORT = process.env.PORT || 4000;
 
@@ -37,23 +37,18 @@ async function seedAdmin() {
 
 assertProductionSecrets();
 
-async function seedPlans() {
-  const count = await SubscriptionPlan.countDocuments();
-  if (count === 0) {
-    await SubscriptionPlan.create([
-      { code: 'free', name: 'Gratuit', price: 0, durationMonths: 1, features: { maxDevices: 1, maxResolution: '720p', hasContinueWatching: false, hasWatchHistory: false, hasDownloads: false } },
-      { code: 'standard', name: 'Standard', price: 4.99, durationMonths: 1, features: { maxDevices: 2, maxResolution: '1080p', hasContinueWatching: true, hasWatchHistory: true, hasDownloads: false } },
-      { code: 'premium', name: 'Premium', price: 9.99, durationMonths: 1, features: { maxDevices: 4, maxResolution: '4K', hasContinueWatching: true, hasWatchHistory: true, hasDownloads: true } }
-    ]);
-    console.log('[Admin] Plans d\'abonnement créés (Free, Standard, Premium)');
-  }
-}
-
 connectDB().then(async () => {
   await seedAdmin();
-  await seedPlans();
   app.listen(PORT, () => {
     console.log(`[Chiller API] Running on http://localhost:${PORT}`);
-    console.log(`[Chiller System] Cron géré par GitHub Actions. Le backend ne lance plus de tâches automatiques.`);
+    // Démarre le scheduler (scraping + maintenance) sauf opt-out explicite.
+    if (process.env.DISABLE_CRON === 'true') {
+      console.log(`[Chiller System] Cron manager disabled (DISABLE_CRON=true).`);
+    } else {
+      startCron();
+      console.log(`[Chiller System] Cron manager attached and running.`);
+    }
+    // Migration DoodStream → Uqload une fois par déploiement (non bloquant).
+    runDeployTasksOnce().catch((err) => console.error('[Deploy] Migration Uqload échouée:', err));
   });
 });

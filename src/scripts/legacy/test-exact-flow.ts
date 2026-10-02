@@ -2,7 +2,7 @@ import dotenv from 'dotenv';
 import path from 'path';
 dotenv.config({ path: path.join(__dirname, '../../.env') });
 
-import { ProviderManager } from '../../streaming/provider-manager';
+import { ProviderManager } from '../../modules/streaming/provider-manager';
 
 async function main() {
   const manager = new ProviderManager();

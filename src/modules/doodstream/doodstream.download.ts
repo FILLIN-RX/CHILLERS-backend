@@ -99,7 +99,7 @@ async function getFreshUqloadHls(fileCode: string): Promise<{ url: string; type:
     return { url: cached.url, type: 'hls' };
   }
   try {
-    const { scrapeUqloadEmbedDirect } = await import('../../streaming/providers/direct-scraper');
+    const { scrapeUqloadEmbedDirect } = await import('../streaming/providers/direct-scraper');
     const scraped = await scrapeUqloadEmbedDirect(fileCode);
     if (!scraped) {
       console.log(`[Download] Uqload embed scrape returned null for code=${fileCode}`);
@@ -345,164 +345,6 @@ async function findByMongoDB(title?: string, tmdbId?: number, season?: number, e
   return null;
 }
 
-async function resolveLinkFromOpenOtaku(
-  title?: string,
-  tmdbId?: number,
-  season?: number,
-  episode?: number,
-  type?: 'movie' | 'series' | 'anime'
-): Promise<string | null> {
-  try {
-    let searchTitle = title;
-    if (!searchTitle && tmdbId) {
-      const Movie = (await import('../../models/Movie')).default;
-      const Serie = (await import('../../models/Serie')).default;
-      const m = await Movie.findOne({ tmdbId }).lean();
-      if (m?.titre) searchTitle = m.titre;
-      else {
-        const s = await Serie.findOne({ tmdbId }).lean();
-        if (s?.titre) searchTitle = s.titre;
-      }
-    }
-    if (!searchTitle) return null;
-
-    console.log(`[Download OpenOtaku Fallback] Resolving "${searchTitle}" S${season || 1}E${episode || 1}...`);
-
-    const isSeries = (season !== undefined && episode !== undefined) || type === 'series' || type === 'anime';
-
-    // Génération de requêtes de recherche intelligentes (apostrophes droites/courbes, sans articles, mots-clés)
-    const queriesToTry = new Set<string>();
-    if (isSeries && season !== undefined) {
-      queriesToTry.add(`${searchTitle} - Saison ${season}`);
-      queriesToTry.add(`${searchTitle} Saison ${season}`);
-    }
-    queriesToTry.add(searchTitle);
-    queriesToTry.add(searchTitle.replace(/'/g, '’'));
-    queriesToTry.add(searchTitle.replace(/’/g, "'"));
-    queriesToTry.add(searchTitle.replace(/^(le|la|les|l'|l’|the|un|une|des)\s+/i, '').trim());
-    queriesToTry.add(searchTitle.replace(/['’`":\-]/g, ' ').replace(/\s+/g, ' ').trim());
-
-    // Mots-clés significatifs (ex: "Oak Street" pour "La Fin d'Oak Street")
-    const words = searchTitle.replace(/['’`":\-]/g, ' ').split(/\s+/).filter(w => w.length > 2 && !['les', 'des', 'une', 'the', 'fin', 'pour'].includes(w.toLowerCase()));
-    if (words.length >= 2) {
-      queriesToTry.add(words.join(' '));
-    }
-
-    const allResults: Array<{ id: string; title: string }> = [];
-
-    for (const q of queriesToTry) {
-      try {
-        const { data: searchRes } = await axios.get('https://www.open-otaku.me/api/fs-search', {
-          params: { q },
-          timeout: 10000,
-          headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-        if (searchRes?.results?.length) {
-          for (const r of searchRes.results) {
-            if (!allResults.some(x => x.id === r.id)) {
-              allResults.push(r);
-            }
-          }
-        }
-      } catch {}
-    }
-
-    if (!allResults.length) {
-      console.log(`[Download OpenOtaku Fallback] ⚠️ Aucun résultat trouvé pour "${searchTitle}"`);
-      return null;
-    }
-
-    // Si c'est une série, prioriser les résultats correspondant à la bonne saison
-    if (isSeries && season !== undefined) {
-      allResults.sort((a, b) => {
-        const aHas = (a.title || '').toLowerCase().includes(`saison ${season}`) ? 1 : 0;
-        const bHas = (b.title || '').toLowerCase().includes(`saison ${season}`) ? 1 : 0;
-        return bHas - aHas;
-      });
-    }
-
-    for (const item of allResults.slice(0, 4)) {
-      try {
-        const { data: watch } = await axios.get('https://www.open-otaku.me/api/fs-watch', {
-          params: { id: item.id },
-          timeout: 15000,
-          headers: { 'User-Agent': 'Mozilla/5.0' }
-        });
-
-        const candidateUrls: string[] = [];
-
-        if (isSeries && watch?.episodes && Object.keys(watch.episodes).length > 0) {
-          const vfMap = watch.episodes.vf || {};
-          const vostfrMap = watch.episodes.vostfr || {};
-          const version = Object.keys(vfMap).length > 0 ? vfMap : vostfrMap;
-          const targetEp = String(episode || 1);
-          const epData = version[targetEp] || Object.values(version)[0] || {};
-          
-          const orderedKeys = ['vidzy', 'luluvid', 'premium', 'default', ...Object.keys(epData)];
-          for (const k of orderedKeys) {
-            const u = epData[k];
-            if (typeof u === 'string' && u.startsWith('http') && !candidateUrls.includes(u)) {
-              candidateUrls.push(u);
-            }
-          }
-        } else if (watch?.players && Object.keys(watch.players).length > 0) {
-          const players = watch.players;
-          const orderedKeys = ['vidzy', 'luluvid', 'premium', 'default', ...Object.keys(players)];
-          for (const k of orderedKeys) {
-            const p = players[k];
-            if (!p) continue;
-            const urls = typeof p === 'string' ? [p] : Object.values(p);
-            for (const u of urls) {
-              if (typeof u === 'string' && u.startsWith('http') && !candidateUrls.includes(u)) {
-                candidateUrls.push(u);
-              }
-            }
-          }
-        }
-
-        for (const embedUrl of candidateUrls) {
-          let dlUrl = embedUrl;
-          if (dlUrl.includes('vidzy.')) dlUrl = dlUrl.replace('/embed-', '/d/').replace('.html', '_n.html');
-          else if (dlUrl.includes('luluvid.')) dlUrl = dlUrl.replace('/embed-', '/d/').replace('.html', '');
-
-          try {
-            const { data: dlRes } = await axios.get('https://www.open-otaku.me/api/dl', {
-              params: { url: dlUrl },
-              timeout: 15000,
-              headers: { 'User-Agent': 'Mozilla/5.0' }
-            });
-            if (dlRes?.success && dlRes?.downloadUrl) {
-              console.log(`[Download OpenOtaku Fallback] ✅ Direct link resolved: ${dlRes.downloadUrl.slice(0, 60)}...`);
-              return dlRes.downloadUrl;
-            }
-          } catch (_) {}
-
-          if (dlUrl !== embedUrl) {
-            try {
-              const { data: dlResRaw } = await axios.get('https://www.open-otaku.me/api/dl', {
-                params: { url: embedUrl },
-                timeout: 15000,
-                headers: { 'User-Agent': 'Mozilla/5.0' }
-              });
-              if (dlResRaw?.success && dlResRaw?.downloadUrl) {
-                console.log(`[Download OpenOtaku Fallback] ✅ Direct link resolved (raw): ${dlResRaw.downloadUrl.slice(0, 60)}...`);
-                return dlResRaw.downloadUrl;
-              }
-            } catch (_) {}
-          }
-        }
-
-        if (candidateUrls.length > 0) {
-          return candidateUrls[0];
-        }
-      } catch (_) {}
-    }
-  } catch (err: any) {
-    console.error(`[Download OpenOtaku Fallback] Error:`, err.message);
-  }
-  return null;
-}
-
 export const getDownloadByTitle = async (req: Request, res: Response, next: NextFunction) => {
   try {
     const { title, tmdb_id, file_code, season, episode } = req.query as Record<string, string>;
@@ -543,28 +385,24 @@ export const getDownloadByTitle = async (req: Request, res: Response, next: Next
     }
 
     if (!match) {
-      // Fallback direct sur OpenOtaku
-      const otakuLink = await resolveLinkFromOpenOtaku(title, tmdb_id ? Number(tmdb_id) : undefined, seasonNum, episodeNum, req.query.type as any);
-      if (otakuLink) {
-        return res.json({
-          success: true,
-          data: {
-            fileCode: '',
-            directUrl: otakuLink,
-            downloadUrl: otakuLink,
-            title: title || '',
-          },
-          message: null,
-        });
-      }
-
       return res.json({
         success: false,
         data: null,
-        message: 'No DoodStream or OpenOtaku file found',
+        message: 'No DoodStream file found',
       });
     }
 
+    // ── Résolution de l'URL de téléchargement ────────────────────────────
+    //
+    // Priorité pour les fichiers Uqload :
+    //   1. API direct_link → URL MP4 fraîche → proxy backend (MÊME IP → 200)
+    //   2. Scraping PACKER → flux HLS → FFmpeg proxy (si API indisponible)
+    //   3. DoodStream /d/ en dernier recours
+    //
+    // ⚠ On ne renvoie JAMAIS une URL .mp4 directe au navigateur :
+    //   les tokens Uqload sont liés à l'IP serveur → le browser (IP
+    //   différente) reçoit un 403. Le proxy backend évite ce problème.
+    // ─────────────────────────────────────────────────────────────────────
     let downloadUrl: string | null = null;
 
     const uqloadCode = match.info.uqloadCode ||
@@ -590,6 +428,9 @@ export const getDownloadByTitle = async (req: Request, res: Response, next: Next
     const filename = `${match.info.titre || title || 'video'}.mp4`;
 
     if (uqloadCode) {
+      // ── Priorité 1 : Scraping PACKER → HLS master playlist (avec view ID v) → FFmpeg proxy
+      // L'URL HLS extraite du PACKER contient le paramètre view ID (ex: v=1988399),
+      // ce qui permet à FFmpeg de télécharger et assembler la vidéo MP4 complète.
       const fresh = await getFreshUqloadHls(uqloadCode);
       if (fresh?.type === 'hls') {
         downloadUrl = buildHlsDownloadUrl(fresh.url, filename);
@@ -597,24 +438,16 @@ export const getDownloadByTitle = async (req: Request, res: Response, next: Next
       }
     }
 
+    // ── Fallback : liens stockés en base non-DoodStream ────────────────
     if (!downloadUrl) {
-      const streamtapeDirect = match.info.streamtapeCode
-        ? `https://streamtape.com/v/${match.info.streamtapeCode}`
-        : match.info.streamtapeLink;
-
       const linksToTry = [
         match.info.uqloadLink !== match.info.lien ? match.info.uqloadLink : undefined,
         match.info.lien,
-        streamtapeDirect,
         match.info.lienFallback,
       ].filter(Boolean) as string[];
 
       for (const url of [...new Set(linksToTry)]) {
         if (!url || /doodstream\.com\/(e|d)\//i.test(url)) continue;
-        if (url.includes('streamtape.com/v/')) {
-          downloadUrl = url;
-          break;
-        }
         const alive = await isLinkAlive(url);
         if (alive) {
           downloadUrl = url;
@@ -623,6 +456,7 @@ export const getDownloadByTitle = async (req: Request, res: Response, next: Next
       }
     }
 
+    // 3) DoodStream /d/ page as last resort
     if (!downloadUrl) {
       const doodCode =
         match.fileCode ||
@@ -631,14 +465,6 @@ export const getDownloadByTitle = async (req: Request, res: Response, next: Next
         extractDoodFileCode(match.info.lienFallback);
       if (doodCode) {
         downloadUrl = `https://doodstream.com/d/${doodCode}`;
-      }
-    }
-
-    // Dernier recours : résolution directe OpenOtaku à la volée
-    if (!downloadUrl) {
-      const otakuLink = await resolveLinkFromOpenOtaku(match.info.titre || title, tmdb_id ? Number(tmdb_id) : undefined, seasonNum, episodeNum, req.query.type as any);
-      if (otakuLink) {
-        downloadUrl = otakuLink;
       }
     }
 
@@ -663,9 +489,8 @@ export const getDownloadByTitle = async (req: Request, res: Response, next: Next
       },
       message: null,
     });
-  } catch (err: any) {
-    console.error('[Download] getDownloadByTitle error:', err);
-    return res.status(500).json({ success: false, data: null, message: err.message });
+  } catch (error) {
+    next(error);
   }
 };
 
@@ -764,15 +589,13 @@ export const proxyStream = async (req: Request, res: Response, next: NextFunctio
     }
 
     const headers: Record<string, string> = {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
       'Referer': referer || 'https://vidzy.cc/',
     };
 
     if (req.headers.range) {
       headers['Range'] = req.headers.range as string;
     }
-
-    const isSegment = /\.(ts|m4s|mp4|webm)(\?|$)/i.test(url) && !url.includes('.m3u8');
 
     const response = await axios.get(url, {
       responseType: 'stream',
@@ -781,19 +604,8 @@ export const proxyStream = async (req: Request, res: Response, next: NextFunctio
       headers,
     });
 
-    // Abort upstream stream if client disconnects
-    req.on('close', () => {
-      try {
-        response.data?.destroy?.();
-      } catch {}
-    });
-
     const contentType = (response.headers['content-type'] as string || '').toLowerCase();
-    const isHls = contentType.includes('mpegurl') || url.endsWith('.m3u8') || url.includes('.m3u8?');
-
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Range, User-Agent, Referer, Content-Type');
+    const isHls = contentType.includes('mpegurl') || url.endsWith('.m3u8');
 
     if (isHls) {
       const contentLength = response.headers['content-length'] as string | undefined;
@@ -801,8 +613,8 @@ export const proxyStream = async (req: Request, res: Response, next: NextFunctio
         res.setHeader('Content-Length', contentLength);
       }
       res.setHeader('Content-Type', 'application/vnd.apple.mpegurl');
-      // Manifests must not be cached long, but allow small 5s caching to reduce storms on bad networks
-      res.setHeader('Cache-Control', 'public, max-age=5, stale-while-revalidate=10');
+      res.setHeader('Cache-Control', 'no-cache');
+      res.setHeader('Access-Control-Allow-Origin', '*');
 
       const body = await axios.get(url, {
         timeout: 30000,
@@ -835,14 +647,6 @@ export const proxyStream = async (req: Request, res: Response, next: NextFunctio
       return;
     }
 
-    // Static segment (.ts / .m4s / video chunks) caching optimization:
-    // This allows the browser to cache media segments and not redownload them when seeking or rewinding
-    if (isSegment) {
-      res.setHeader('Cache-Control', 'public, max-age=86400, immutable');
-    } else {
-      res.setHeader('Cache-Control', 'public, max-age=3600');
-    }
-
     const contentLength = response.headers['content-length'] as string | undefined;
     if (contentLength) {
       res.setHeader('Content-Length', contentLength);
@@ -853,8 +657,15 @@ export const proxyStream = async (req: Request, res: Response, next: NextFunctio
       res.setHeader('Content-Range', contentRange);
     }
 
-    res.setHeader('Accept-Ranges', 'bytes');
+    const acceptRanges = response.headers['accept-ranges'] as string | undefined;
+    if (acceptRanges) {
+      res.setHeader('Accept-Ranges', acceptRanges);
+    }
+
     res.setHeader('Content-Type', response.headers['content-type'] as string || 'video/mp4');
+    if (req.headers.range) {
+      res.setHeader('Accept-Ranges', 'bytes');
+    }
 
     res.status(response.status);
     response.data.pipe(res);

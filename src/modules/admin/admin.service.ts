@@ -20,11 +20,8 @@ function readLogFile(filename: string, lines: number = 100): string[] {
 }
 
 export async function getDashboardStats() {
-    const animeFilter = { pageUrl: /newsid/ };
     const moviesCount = await Movie.countDocuments();
     const seriesCount = await Serie.countDocuments();
-    const animeMovies = await Movie.countDocuments(animeFilter);
-    const animeSeries = await Serie.countDocuments(animeFilter);
     const completeSeries = await Serie.countDocuments({ pageUrl: { $ne: null }, episodes: { $ne: [] } });
     const totalEpisodes = await Serie.aggregate([
         { $unwind: '$episodes' },
@@ -37,16 +34,10 @@ export async function getDashboardStats() {
 
     const tmdbLinkedMovies = await Movie.countDocuments({ tmdbId: { $ne: null } });
     const tmdbLinkedSeries = await Serie.countDocuments({ tmdbId: { $ne: null } });
-    const tmdbLinkedAnimeMovies = await Movie.countDocuments({ ...animeFilter, tmdbId: { $ne: null } });
-    const tmdbLinkedAnimeSeries = await Serie.countDocuments({ ...animeFilter, tmdbId: { $ne: null } });
 
     return {
         movies: moviesCount,
         series: seriesCount,
-        animes: animeMovies + animeSeries,
-        animeMovies,
-        animeSeries,
-        tmdbLinkedAnimes: tmdbLinkedAnimeMovies + tmdbLinkedAnimeSeries,
         completeSeries,
         totalEpisodes: totalEpisodes[0]?.total || 0,
         deadLinks: deadLinksCount,
@@ -68,7 +59,7 @@ export async function appealDeadLink(id: string) {
     const link = await DeadLink.findById(id);
     if (!link) return { found: false, alive: false };
 
-    const { isLinkDead } = await import('../../scraping/core/link-checker');
+    const { isLinkDead } = await import('../scraping/core/link-checker');
     const dead = await isLinkDead(link.lien);
     if (!dead) {
         await DeadLink.findByIdAndDelete(id);
@@ -95,29 +86,9 @@ export function getCronLogs(lines: number = 100) {
 }
 
 export async function searchCollection(type: string, q: string, page: number, limit: number) {
-    const regex = q ? { $regex: q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' } : null;
-
-    if (type === 'animes') {
-        const filter: any = { pageUrl: /newsid/ };
-        if (regex) filter.titre = regex;
-        const [movies, series, total] = await Promise.all([
-            Movie.find(filter, 'titre pageUrl lien tmdbId createdAt uqloadCode uqloadLink fileCode')
-                .sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
-            Serie.find(filter, 'titre pageUrl tmdbId createdAt episodes.uqloadCode episodes.fileCode episodes.episode episodes.season episodes.episodeNumber episodes.lien')
-                .sort({ createdAt: -1 }).skip((page - 1) * limit).limit(limit).lean(),
-            Movie.countDocuments(filter).then(n => Serie.countDocuments(filter).then(m => n + m)),
-        ]);
-        const items = [
-            ...movies.map(m => ({ ...m, kind: 'movie' })),
-            ...series.map(s => ({ ...s, kind: 'series' })),
-        ].sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime())
-            .slice((page - 1) * limit, page * limit);
-        return { items, total, page, limit, totalPages: Math.max(1, Math.ceil(total / limit)) };
-    }
-
     const Model: any = type === 'series' ? Serie : Movie;
     const filter: any = {};
-    if (regex) filter.titre = regex;
+    if (q) filter.titre = { $regex: q.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
 
     const projection = type === 'series'
       ? 'titre pageUrl lien tmdbId createdAt episodes.uqloadCode episodes.fileCode episodes.episode episodes.season episodes.episodeNumber episodes.lien'
@@ -130,12 +101,9 @@ export async function searchCollection(type: string, q: string, page: number, li
 }
 
 export async function getRecentItems() {
-    const animeFilter = { pageUrl: /newsid/ };
-    const [recentMovies, recentSeries, recentAnimeMovies, recentAnimeSeries] = await Promise.all([
+    const [recentMovies, recentSeries] = await Promise.all([
         Movie.find().sort({ createdAt: -1 }).limit(5).select('titre createdAt tmdbId').lean(),
         Serie.find().sort({ createdAt: -1 }).limit(5).select('titre createdAt tmdbId episodes').lean(),
-        Movie.find(animeFilter).sort({ createdAt: -1 }).limit(5).select('titre createdAt tmdbId').lean(),
-        Serie.find(animeFilter).sort({ createdAt: -1 }).limit(5).select('titre createdAt tmdbId episodes').lean(),
     ]);
 
     const now = Date.now();
@@ -164,26 +132,6 @@ export async function getRecentItems() {
             addedAt: s.createdAt,
             ago: fmt(s.createdAt),
         })),
-        animes: [
-            ...recentAnimeMovies.map(m => ({
-                _id: m._id,
-                titre: m.titre,
-                tmdbId: m.tmdbId,
-                kind: 'movie' as const,
-                episodesCount: 1,
-                addedAt: m.createdAt,
-                ago: fmt(m.createdAt),
-            })),
-            ...recentAnimeSeries.map(s => ({
-                _id: s._id,
-                titre: s.titre,
-                tmdbId: s.tmdbId,
-                kind: 'series' as const,
-                episodesCount: (s as any).episodes?.length || 0,
-                addedAt: s.createdAt,
-                ago: fmt(s.createdAt),
-            })),
-        ].sort((a, b) => new Date(b.addedAt).getTime() - new Date(a.addedAt).getTime()).slice(0, 5),
     };
 }
 
@@ -240,11 +188,9 @@ export async function getScraperState() {
     const ScraperState = (await import('../../models/ScraperState')).default;
     const films = await ScraperState.findOne({ name: 'films' });
     const series = await ScraperState.findOne({ name: 'series' });
-    const animes = await ScraperState.findOne({ name: 'animes' });
     return {
         films: films ? { lastPage: films.lastPage, updatedAt: films.updatedAt } : null,
         series: series ? { lastPage: series.lastPage, updatedAt: series.updatedAt } : null,
-        animes: animes ? { lastPage: animes.lastPage, updatedAt: animes.updatedAt } : null,
     };
 }
 

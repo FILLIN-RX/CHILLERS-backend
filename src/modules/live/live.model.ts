@@ -1,6 +1,30 @@
-// @ts-nocheck
-import * as mongoose_1 from "mongoose";
-exports.liveChannelSchema = new mongoose_1.Schema({
+import { Schema, Document } from 'mongoose';
+
+export type LiveChannelType = 'hls' | 'youtube' | 'dailymotion';
+
+export interface LiveChannelDoc extends Document {
+  name: string;
+  slug: string;
+  logo?: string;
+  categories: string[];
+  country?: string;
+  language?: string;
+  type: LiveChannelType;
+  streamUrl?: string;
+  ytVideoId?: string;
+  referer?: string;
+  userAgent?: string;
+  enabled: boolean;
+  order: number;
+  lastChecked?: Date;
+  isOnline: boolean;
+  source?: string;
+  createdAt: Date;
+  updatedAt: Date;
+}
+
+export const liveChannelSchema = new Schema<LiveChannelDoc>(
+  {
     name: { type: String, required: true, trim: true },
     slug: { type: String, required: true, unique: true, trim: true, lowercase: true },
     logo: { type: String, default: '' },
@@ -17,4 +41,6 @@ exports.liveChannelSchema = new mongoose_1.Schema({
     lastChecked: { type: Date },
     isOnline: { type: Boolean, default: false },
     source: { type: String, default: '' },
-}, { timestamps: true });
+  },
+  { timestamps: true }
+);

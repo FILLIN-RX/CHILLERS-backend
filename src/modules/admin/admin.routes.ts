@@ -1,7 +1,6 @@
 import { Router } from 'express';
 import { adminMiddleware, adminSseMiddleware } from './admin.middleware';
 import * as adminController from './admin.controller';
-import * as subController from './subscription.controller';
 import { mediaUpload } from './media.upload';
 
 const router = Router();
@@ -47,8 +46,6 @@ router.post('/uqload/stop', adminMiddleware, adminController.uqloadStop);
 router.get('/uqload/status', adminMiddleware, adminController.uqloadStatus);
 router.get('/uqload/pending', adminMiddleware, adminController.uqloadPending);
 router.get('/uqload/pending-both', adminMiddleware, adminController.uqloadPendingBoth);
-router.get('/uqload/files', adminMiddleware, adminController.uqloadFiles);
-router.get('/uqload/file-info/:code', adminMiddleware, adminController.uqloadFileInfo);
 
 router.get('/media/tmdb-search', adminMiddleware, adminController.tmdbSearch);
 router.post('/media/manual', adminMiddleware, adminController.createManualMedia);
@@ -57,11 +54,5 @@ router.post('/media/manual/upload', adminMiddleware, mediaUpload.array('files', 
 // Scrapper distant proxy routes
 router.get('/scrapper/{*path}', adminMiddleware, adminController.scrapperProxyGet);
 router.post('/scrapper/{*path}', adminMiddleware, adminController.scrapperProxyPost);
-
-// Subscription Plans
-router.get('/subscriptions', adminMiddleware, subController.getPlans);
-router.post('/subscriptions', adminMiddleware, subController.createPlan);
-router.put('/subscriptions/:id', adminMiddleware, subController.updatePlan);
-router.delete('/subscriptions/:id', adminMiddleware, subController.deletePlan);
 
 export default router;

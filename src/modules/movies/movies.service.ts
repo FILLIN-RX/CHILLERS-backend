@@ -22,28 +22,10 @@ export const getTopRated = async (page: number = 1, language?: string) => {
 };
 
 export const getDetails = async (id: string, language?: string) => {
-  try {
-    const { data } = await tmdbClient.get(`/movie/${id}`, {
-      params: { 
-        append_to_response: 'credits,videos,release_dates,recommendations,similar', 
-        language: toTMDBLanguage(language) 
-      },
-    });
-    return data;
-  } catch (err: any) {
-    if (err?.response?.status === 404) {
-      try {
-        const { data } = await tmdbClient.get(`/tv/${id}`, {
-          params: { 
-            append_to_response: 'credits,videos,content_ratings,recommendations,similar', 
-            language: toTMDBLanguage(language) 
-          },
-        });
-        return data;
-      } catch (_) {}
-    }
-    throw err;
-  }
+  const { data } = await tmdbClient.get(`/movie/${id}`, {
+    params: { append_to_response: 'credits,videos', language: toTMDBLanguage(language) },
+  });
+  return data;
 };
 
 export const getRecommendations = async (id: string, language?: string) => {
@@ -63,19 +45,6 @@ export const getTrailer = async (id: string, language?: string) => {
 export const getByGenre = async (genreId: string, page: number = 1, language?: string) => {
   const { data } = await tmdbClient.get('/discover/movie', {
     params: { with_genres: genreId, sort_by: 'popularity.desc', page, language: toTMDBLanguage(language) },
-  });
-  return data;
-};
-
-export const getAfrican = async (page: number = 1, language?: string, country?: string) => {
-  const originCountry = country || 'NG|GH|CM|CI|SN';
-  const { data } = await tmdbClient.get('/discover/movie', {
-    params: { 
-      with_origin_country: originCountry, 
-      sort_by: 'popularity.desc', 
-      page, 
-      language: toTMDBLanguage(language) 
-    },
   });
   return data;
 };

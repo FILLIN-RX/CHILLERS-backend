@@ -4,8 +4,8 @@
   "description": "Chiller streaming platform backend - Secure gateway to TMDB API",
   "main": "dist/server.js",
   "scripts": {
-    "start": "node --max-old-space-size=350 dist/server.js",
-    "build": "tsc && cp src/scraping/core/uploaded.json dist/scraping/core/uploaded.json 2>/dev/null || true && cp src/scraping/core/series-output.json dist/scraping/core/series-output.json 2>/dev/null || true",
+    "start": "node dist/server.js",
+    "build": "tsc && mkdir -p dist/modules/scraping/core && cp src/modules/scraping/core/uploaded.json dist/modules/scraping/core/uploaded.json 2>/dev/null || true && cp src/modules/scraping/core/series-output.json dist/modules/scraping/core/series-output.json 2>/dev/null || true",
     "dev": "tsx watch src/server.ts",
     "preview": "node dist/server.js",
     "upload": "npx tsx src/scripts/upload-doodstream.ts",
@@ -13,11 +13,12 @@
     "upload-uqload:verify": "npx tsx src/scripts/upload-uqload.ts --verify",
     "migrate-dood-to-uqload": "npx tsx src/scripts/migrate-dood-to-uqload.ts",
     "check-sources": "npx tsx src/scripts/check-sources.ts",
+    "check-uqload-inactive": "npx tsx src/scripts/check-uqload-inactive.ts",
+    "sync-live-channels": "npx tsx src/scripts/sync-live-channels.ts",
     "upload-series": "npx tsx src/scripts/upload-series-doodstream.ts",
     "organize-series": "npx tsx src/scripts/organize-series.ts",
     "check-status": "npx tsx src/scripts/check-upload-status.ts",
-    "otaku-picker": "npx tsx src/scripts/openotaku-picker.ts",
-    "keepalive": "npx tsx src/scraping/maintenance/keepalive-uqload.ts"
+    "otaku-picker": "npx tsx src/scripts/openotaku-picker.ts"
   },
   "keywords": [
     "chiller",
@@ -29,9 +30,8 @@
   "license": "ISC",
   "dependencies": {
     "@types/node-cron": "^3.0.11",
-    "axios": "^1.18.1",
+    "axios": "^1.19.0",
     "bcryptjs": "^3.0.3",
-    "compression": "^1.8.1",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
@@ -49,7 +49,6 @@
   "devDependencies": {
     "@playwright/test": "^1.61.1",
     "@types/bcryptjs": "^2.4.6",
-    "@types/compression": "^1.8.1",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/jsonwebtoken": "^9.0.10",
