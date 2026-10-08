@@ -16,7 +16,42 @@ import {
   FFMPEG_PATH,
   isTorrentsConfigured,
 } from './config';
-import { errMessage } from './torrents.utils';
+import { errMessage } from './utils/torrents.utils';
+import { verifyTorrentToken } from './utils/stream-token';
+
+const HASH_RE = /^[0-9a-f]{40}$/i;
+
+/** Un transcode = un process FFmpeg + un attachement P2P : trois suffisent par conteneur. */
+const MAX_CONCURRENT_TRANSCODES = 3;
+let activeTranscodes = 0;
+
+/**
+ * Contrôle une requête de flux torrent.
+ *
+ * Le hash n'est légitime que s'il sort du ProviderManager : `buildStreamUrl`
+ * signe (hash, index) avec JWT_SECRET. Sans ce contrôle, la route était un
+ * relais P2P anonyme — n'importe quel visiteur pouvait faire télécharger et
+ * transcoder l'info_hash de son choix par l'IP du serveur.
+ */
+function readTorrentTarget(req: Request, res: Response): { hash: string; index: number } | null {
+  const hash = String(req.query.hash || '');
+  const index = Number(String(req.query.index ?? '0'));
+
+  if (!HASH_RE.test(hash)) {
+    res.status(400).send('Hash de torrent invalide');
+    return null;
+  }
+  if (!Number.isInteger(index) || index < 0 || index > 9999) {
+    res.status(400).send('Index de fichier invalide');
+    return null;
+  }
+  if (!verifyTorrentToken(req.query.t as string | undefined, { hash, index })) {
+    res.status(403).json({ success: false, message: 'Jeton de flux invalide ou expiré' });
+    return null;
+  }
+
+  return { hash, index };
+}
 
 export async function healthCheck(_req: Request, res: Response) {
   if (!isTorrentsConfigured()) {
@@ -96,12 +131,15 @@ function ffmpegArgs(inputUrl: string, seekSeconds?: number): string[] {
 
 /** Transcode le flux TorrServer en MP4 fragmenté compatible <video>, avec seek. */
 export async function streamFile(req: Request, res: Response) {
-  const hash = req.query.hash as string;
-  const index = req.query.index as string | undefined;
-  if (!hash) {
-    res.status(400).send('Hash requis');
+  const target = readTorrentTarget(req, res);
+  if (!target) return;
+  const { hash, index } = target;
+
+  if (activeTranscodes >= MAX_CONCURRENT_TRANSCODES) {
+    res.status(503).json({ success: false, message: 'Transcode torrents saturé, réessayez' });
     return;
   }
+  activeTranscodes++;
 
   const rangeStart = parseRangeStart(req.headers.range);
 
@@ -110,11 +148,11 @@ export async function streamFile(req: Request, res: Response) {
   // La durée totale d'un flux P2P étant inconnue, Content-Range reste ouvert.
   const seekSeconds = rangeStart ? Math.floor(rangeStart / (TARGET_BITRATE_BPS / 8)) : undefined;
 
-  const inputUrl = `${TORRSERVER_URL}/stream?link=${hash}&index=${index || 0}&play` +
+  const inputUrl = `${TORRSERVER_URL}/stream?link=${hash}&index=${index}&play` +
     (seekSeconds !== undefined ? `&pos=${rangeStart}` : '');
 
   console.log(
-    `[Torrents][FFmpeg] Transcodage à la volée: ${hash} (fichier ${index || 0})` +
+    `[Torrents][FFmpeg] Transcodage à la volée: ${hash} (fichier ${index})` +
       (seekSeconds !== undefined ? ` — seek à ${seekSeconds}s (range ${rangeStart})` : ''),
   );
 
@@ -129,39 +167,50 @@ export async function streamFile(req: Request, res: Response) {
 
   const ffmpeg = spawn(FFMPEG_PATH, ffmpegArgs(inputUrl, seekSeconds));
 
+  let released = false;
+  const release = () => {
+    if (released) return;
+    released = true;
+    activeTranscodes = Math.max(0, activeTranscodes - 1);
+  };
+
   ffmpeg.stdout.pipe(res);
 
   ffmpeg.on('error', (err) => {
+    release();
     console.error('[Torrents][FFmpeg] Erreur:', err.message);
     if (!res.headersSent) res.status(500).send('FFmpeg indisponible sur le serveur');
   });
 
   ffmpeg.on('close', (code) => {
+    release();
     console.log(`[Torrents][FFmpeg] Processus terminé (code ${code})`);
+    if (!res.headersSent && code !== 0) {
+      res.status(502).json({ success: false, message: 'Flux P2P indisponible ou interrompu' });
+      return;
+    }
     if (!res.writableEnded) res.end();
   });
 
   req.on('close', () => {
+    release();
     ffmpeg.kill('SIGKILL');
   });
 }
 
 /** Téléchargement direct du fichier (proxy du flux TorrServer). */
 export async function downloadFile(req: Request, res: Response) {
-  const hash = req.query.hash as string;
-  const index = req.query.index as string | undefined;
+  const target = readTorrentTarget(req, res);
+  if (!target) return;
+  const { hash, index } = target;
   const name = req.query.name as string | undefined;
-  if (!hash) {
-    res.status(400).send('Hash requis');
-    return;
-  }
 
   console.log(`[Torrents][Download] "${name || hash}"`);
 
   try {
     const response = await axios({
       method: 'get',
-      url: `${TORRSERVER_URL}/stream?link=${hash}&index=${index || 0}&play`,
+      url: `${TORRSERVER_URL}/stream?link=${hash}&index=${index}&play`,
       responseType: 'stream',
       timeout: 0,
     });
