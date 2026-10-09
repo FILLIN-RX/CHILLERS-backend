@@ -184,11 +184,22 @@ router.get('/resolve', async (req: Request, res: Response) => {
     // Si ce n'est pas encore un MP4 direct, tenter d'extraire le stream direct (MP4 prioritaire)
     if (directType !== 'mp4' && downloadUrl) {
       try {
-        const direct = await DirectScraper.resolve(downloadUrl, false);
-        if (direct?.directUrl) {
-          downloadUrl = direct.directUrl;
-          directType = direct.type === 'hls' || /\.m3u8/i.test(direct.directUrl) ? 'hls' : 'mp4';
-          console.log(`[Download Resolve] ✅ ${directType.toUpperCase()} direct extrait avec succès pour download: ${downloadUrl.slice(0, 80)}...`);
+        const uqCode = extractUqloadCode(downloadUrl);
+        if (uqCode) {
+          const uqDirect = await DirectScraper.scrapeUqloadEmbedDirect(uqCode);
+          if (uqDirect?.directUrl) {
+            downloadUrl = uqDirect.directUrl;
+            directType = uqDirect.type === 'hls' || /\.m3u8/i.test(uqDirect.directUrl) ? 'hls' : 'mp4';
+            console.log(`[Download Resolve] ✅ Uqload Direct extrait: ${downloadUrl.slice(0, 80)}...`);
+          }
+        }
+        if (directType !== 'mp4' && directType !== 'hls') {
+          const direct = await DirectScraper.resolve(downloadUrl, false);
+          if (direct?.directUrl) {
+            downloadUrl = direct.directUrl;
+            directType = direct.type === 'hls' || /\.m3u8/i.test(direct.directUrl) ? 'hls' : 'mp4';
+            console.log(`[Download Resolve] ✅ ${directType.toUpperCase()} direct extrait avec succès pour download: ${downloadUrl.slice(0, 80)}...`);
+          }
         }
       } catch (err: any) {
         console.warn(`[Download Resolve] Échec extraction direct:`, err.message);
@@ -204,8 +215,17 @@ router.get('/resolve', async (req: Request, res: Response) => {
     const cleanFilename = `${safeTitle}${isTv ? `_S${season || 1}E${episode || 1}` : ''}.mp4`;
 
     const isHtml = /\.html?(\?|$)/i.test(downloadUrl) || downloadUrl.includes('/embed-') || downloadUrl.includes('/e/');
-    const isHls = (directType === 'hls' || /\.m3u8(\?|$)/i.test(downloadUrl)) && !isHtml;
-    const isMp4Direct = (directType === 'mp4' || /\.mp4(\?|$)/i.test(downloadUrl)) && !isHtml;
+    if (isHtml) {
+      console.warn(`[Download Resolve] ⚠️ URL finale reste une page HTML embed (${downloadUrl}) → rejeté pour éviter d'ouvrir une page web au lieu de télécharger.`);
+      return res.status(404).json({
+        success: false,
+        error: "Ce contenu est disponible en streaming iframe mais aucun fichier vidéo brut (MP4) n'a pu être extrait pour le téléchargement direct.",
+        data: null
+      });
+    }
+
+    const isHls = (directType === 'hls' || /\.m3u8(\?|$)/i.test(downloadUrl));
+    const isMp4Direct = (directType === 'mp4' || /\.mp4(\?|$)/i.test(downloadUrl));
 
     let finalDownloadUrl: string;
 
