@@ -7,6 +7,7 @@
  */
 
 import axios from 'axios';
+import crypto from 'crypto';
 import { PROWLARR_URL, PROWLARR_API_KEY } from './config';
 import {
   TorrentCandidate,
@@ -126,21 +127,67 @@ async function searchOnce(query: string, timeoutMs = SEARCH_TIMEOUT): Promise<To
 }
 
 const DEFAULT_TRACKERS = [
-  'udp://open.demonii.com:1337/announce',
-  'udp://tracker.openbittorrent.com:80',
-  'udp://tracker.coppersurfer.tk:6969',
-  'udp://glotorrents.pw:6969/announce',
   'udp://tracker.opentrackr.org:1337/announce',
-  'udp://torrent.gresille.org:80/announce',
-  'udp://p4p.arenabg.com:1337',
-  'udp://tracker.leechers-paradise.org:6969',
+  'udp://open.demonii.com:1337/announce',
+  'udp://open.stealth.si:80/announce',
   'udp://tracker.torrent.eu.org:451/announce',
+  'udp://tracker.openbittorrent.com:6969/announce',
+  'udp://tracker.coppersurfer.tk:6969/announce',
   'udp://explodie.org:6969/announce',
+  'udp://tracker.leechers-paradise.org:6969/announce',
+  'udp://p4p.arenabg.com:1337/announce',
+  'udp://tracker.internetwarriors.net:1337/announce',
+  'udp://tracker.moeking.me:6969/announce',
+  'udp://tracker.dler.org:6969/announce',
+  'http://tracker.openbittorrent.com:80/announce',
 ];
 
 export function buildMagnetFromHash(infoHash: string, title?: string): string {
   const tr = DEFAULT_TRACKERS.map((t) => `&tr=${encodeURIComponent(t)}`).join('');
   return `magnet:?xt=urn:btih:${infoHash.toLowerCase()}${title ? `&dn=${encodeURIComponent(title)}` : ''}${tr}`;
+}
+
+/** Extrait le SHA-1 infoHash d'un buffer .torrent encodé en bencode */
+export function extractInfoHashFromTorrentBuffer(buf: Buffer): string | null {
+  const marker = Buffer.from('4:info');
+  const idx = buf.indexOf(marker);
+  if (idx === -1) return null;
+  const start = idx + marker.length;
+  let depth = 0;
+  let i = start;
+  while (i < buf.length) {
+    const char = String.fromCharCode(buf[i]);
+    if (char === 'd' || char === 'l') {
+      depth++;
+      i++;
+    } else if (char === 'e') {
+      depth--;
+      i++;
+      if (depth === 0) break;
+    } else if (char === 'i') {
+      i++;
+      while (i < buf.length && String.fromCharCode(buf[i]) !== 'e') i++;
+      if (i < buf.length) i++;
+    } else if (char >= '0' && char <= '9') {
+      let lenStr = '';
+      while (i < buf.length && String.fromCharCode(buf[i]) >= '0' && String.fromCharCode(buf[i]) <= '9') {
+        lenStr += String.fromCharCode(buf[i]);
+        i++;
+      }
+      if (i < buf.length && String.fromCharCode(buf[i]) === ':') {
+        i++;
+        const strLen = parseInt(lenStr, 10);
+        i += strLen;
+      }
+    } else {
+      i++;
+    }
+  }
+  if (i <= buf.length && depth === 0) {
+    const infoSlice = buf.subarray(start, i);
+    return crypto.createHash('sha1').update(infoSlice).digest('hex');
+  }
+  return null;
 }
 
 /** Ajoute la clé API Prowlarr à une URL d'indexeur (liens protégés). */
@@ -153,59 +200,54 @@ export function fixProwlarrUrl(url: string): string {
 }
 
 /**
- * Résout le lien d'un résultat : suit les redirections de l'indexeur
- * jusqu'à obtenir un magnet (streaming) ou le fichier .torrent en base64.
+ * Résout le lien d'un résultat en lien magnet directement ingérable par TorrServer.
  *
- * En cas d'échec de téléchargement du .torrent (404/timeout), repli automatique
- * sur un lien magnet direct construit depuis infoHash.
+ * TorrServer attend `action: 'add', link: '<magnet>'`.
+ * Si infoHash est déjà connu (YTS, 1337x, etc.), le magnet complet avec trackers
+ * est généré instantanément sans requête HTTP externe.
  */
 export async function resolveTorrentLink(
   item: TorrentCandidate,
   redirects = 5
-): Promise<{ kind: 'link' | 'file'; data: string }> {
+): Promise<string> {
   // 1. Si on a déjà un magnet natif
   if (item.magnet && item.magnet.startsWith('magnet:')) {
-    return { kind: 'link', data: item.magnet };
+    return item.magnet;
   }
 
-  // 2. Préférer le téléchargement du fichier .torrent via downloadUrl
-  // (Prowlarr fournit un lien HTTP de download valide vers le tracker avec le fichier binaire)
+  // 2. Si on a l'infoHash (40 caractères hex), construction immédiate du magnet avec trackers
+  if (item.infoHash && /^[0-9a-f]{40}$/i.test(item.infoHash)) {
+    return buildMagnetFromHash(item.infoHash, item.title);
+  }
+
+  // 3. Sinon, suivre l'URL HTTP de téléchargement pour récupérer la redirection magnet ou le .torrent
   const url = item.downloadUrl || (item.magnet && item.magnet.startsWith('http') ? item.magnet : undefined);
 
-  if (url) {
+  if (url && redirects > 0) {
     try {
       const response = await axios.get(fixProwlarrUrl(url), {
         maxRedirects: 0,
         validateStatus: (status) => status >= 200 && status < 400,
         responseType: 'arraybuffer',
-        timeout: 15000,
+        timeout: 10000,
       });
 
       if (response.status >= 300 && response.status < 400 && response.headers.location) {
         const location = String(response.headers.location);
-        if (location.startsWith('magnet:')) return { kind: 'link', data: location };
+        if (location.startsWith('magnet:')) return location;
         return resolveTorrentLink({ ...item, downloadUrl: location, magnet: undefined }, redirects - 1);
       }
 
-      const contentType = String(response.headers['content-type'] || '');
-      if (
-        response.data &&
-        response.data.byteLength > 0 &&
-        !contentType.includes('application/json') &&
-        !contentType.includes('text/html')
-      ) {
-        return { kind: 'file', data: Buffer.from(response.data).toString('base64') };
+      if (response.data && response.data.byteLength > 0) {
+        const extracted = extractInfoHashFromTorrentBuffer(Buffer.from(response.data));
+        if (extracted) {
+          return buildMagnetFromHash(extracted, item.title);
+        }
       }
     } catch (err: any) {
-      console.warn(`[Torrents] Échec téléchargement .torrent (${err?.message || err})`);
+      console.warn(`[Torrents] Échec résolution URL .torrent (${err?.message || err})`);
     }
   }
 
-  // 3. Fallback immédiat et inconditionnel : si on a un infoHash, construire le lien magnet direct
-  if (item.infoHash && /^[0-9a-f]{40}$/i.test(item.infoHash)) {
-    console.log(`[Torrents] ✅ Utilisation du lien magnet direct depuis infoHash: ${item.infoHash}`);
-    return { kind: 'link', data: buildMagnetFromHash(item.infoHash, item.title) };
-  }
-
-  throw new Error('Résultat sans lien téléchargeable ni infoHash');
+  throw new Error(`Torrent "${item.title}" sans infoHash ni lien magnet valide`);
 }

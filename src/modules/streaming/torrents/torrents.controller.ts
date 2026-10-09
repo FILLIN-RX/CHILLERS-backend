@@ -110,7 +110,6 @@ function ffmpegArgs(inputUrl: string, seekSeconds?: number): string[] {
     '-hide_banner',
     '-loglevel', 'error',
     ...seek,
-    '-re',
     '-i', inputUrl,
     '-c:v', 'libx264',
     '-preset', 'ultrafast',

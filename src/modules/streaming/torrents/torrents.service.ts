@@ -19,14 +19,14 @@ export interface TorrentFileInfo {
   length: number;
 }
 
-export type TorrentSource = { kind: 'link'; data: string } | { kind: 'file'; data: string };
+export type TorrentSource = string;
 
 /** Temps restant avant le budget du provider ; sert à ne jamais démarrer une étape vouée à l'abort. */
 function leftMs(deadlineAt?: number): number {
   return deadlineAt ? deadlineAt - Date.now() : Number.POSITIVE_INFINITY;
 }
 
-/** Ajoute le torrent (magnet ou fichier .torrent base64) et retourne son hash. */
+/** Ajoute le torrent (lien magnet ou URL) dans TorrServer et retourne son hash. */
 export async function addTorrent(
   source: TorrentSource,
   title: string,
@@ -37,21 +37,22 @@ export async function addTorrent(
 
   const payload: Record<string, unknown> = {
     action: 'add',
+    link: source,
     title: title || 'Chillers Stream',
     save_to_db: true,
   };
-  if (source.kind === 'file') {
-    payload.file = source.data;
-  } else {
-    payload.link = source.data;
-  }
 
   try {
     const res = await axios.post(`${TORRSERVER_URL}/torrents`, payload, {
       timeout: Math.min(ADD_TIMEOUT, left),
     });
     const hash = res.data?.hash;
-    if (!hash) throw new Error('TorrServer: hash introuvable dans la réponse');
+    if (!hash) {
+      if (res.data?.error) {
+        throw new Error(`TorrServer: ${res.data.error}`);
+      }
+      throw new Error('TorrServer: hash introuvable dans la réponse');
+    }
     return hash;
   } catch (err: any) {
     if (err.response?.status === 404 && err.response?.data?.message === 'Route not found') {
