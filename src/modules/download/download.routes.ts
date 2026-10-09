@@ -3,7 +3,7 @@ import { spawn } from 'child_process';
 import axios from 'axios';
 import { ProviderManager } from '../streaming/provider-manager';
 import { StreamQuery } from '../streaming/providers/provider.interface';
-import { DirectScraper, getUqloadDirectLink } from '../streaming/providers/direct-scraper';
+import { DirectScraper, getUqloadDirectLink, extractUqloadCode } from '../streaming/providers/direct-scraper';
 import Movie from '../../models/Movie';
 import Serie from '../../models/Serie';
 
@@ -95,22 +95,23 @@ router.get('/resolve', async (req: Request, res: Response) => {
         const eNum = query.episode !== undefined ? Number(query.episode) : 1;
         const ep = serie.episodes?.find((e: any) => Number(e.season) === sNum && Number(e.episodeNumber) === eNum);
         if (ep) {
-          if (ep.uqloadCode) {
-            const uq = await getUqloadDirectLink(ep.uqloadCode, false);
+          const uqCode = ep.uqloadCode || (ep.uqloadLink ? extractUqloadCode(ep.uqloadLink) : null) || (ep.lien ? extractUqloadCode(ep.lien) : null);
+          if (uqCode) {
+            const uq = await getUqloadDirectLink(uqCode, false);
             if (uq?.directUrl) {
               downloadUrl = uq.directUrl;
-              directType = 'mp4';
+              directType = uq.type === 'hls' ? 'hls' : 'mp4';
               resolvedProvider = 'uqload';
             }
           }
           if (!downloadUrl && ep.uqloadLink) {
             downloadUrl = ep.uqloadLink;
-            directType = 'mp4';
+            directType = 'embed';
             resolvedProvider = 'uqload';
           }
           if (!downloadUrl && ep.lien) {
             downloadUrl = ep.lien;
-            directType = /\.mp4(\?|$)/i.test(ep.lien) ? 'mp4' : 'embed';
+            directType = /\.mp4(\?|$)/i.test(ep.lien) ? 'mp4' : /\.m3u8(\?|$)/i.test(ep.lien) ? 'hls' : 'embed';
             resolvedProvider = 'mongodb';
           }
         }
@@ -122,22 +123,23 @@ router.get('/resolve', async (req: Request, res: Response) => {
           ? await Movie.findOne({ titre: { $regex: new RegExp(cleanTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'i') } }).lean().exec()
           : null;
       if (movie) {
-        if (movie.uqloadCode) {
-          const uq = await getUqloadDirectLink(movie.uqloadCode, false);
+        const uqCode = movie.uqloadCode || (movie.uqloadLink ? extractUqloadCode(movie.uqloadLink) : null) || (movie.lien ? extractUqloadCode(movie.lien) : null);
+        if (uqCode) {
+          const uq = await getUqloadDirectLink(uqCode, false);
           if (uq?.directUrl) {
             downloadUrl = uq.directUrl;
-            directType = 'mp4';
+            directType = uq.type === 'hls' ? 'hls' : 'mp4';
             resolvedProvider = 'uqload';
           }
         }
         if (!downloadUrl && movie.uqloadLink) {
           downloadUrl = movie.uqloadLink;
-          directType = 'mp4';
+          directType = 'embed';
           resolvedProvider = 'uqload';
         }
         if (!downloadUrl && movie.lien) {
           downloadUrl = movie.lien;
-          directType = /\.mp4(\?|$)/i.test(movie.lien) ? 'mp4' : 'embed';
+          directType = /\.mp4(\?|$)/i.test(movie.lien) ? 'mp4' : /\.m3u8(\?|$)/i.test(movie.lien) ? 'hls' : 'embed';
           resolvedProvider = 'mongodb';
         }
       }
@@ -179,17 +181,17 @@ router.get('/resolve', async (req: Request, res: Response) => {
       }
     }
 
-    // Si ce n'est pas encore un MP4 direct, tenter d'extraire le MP4 direct
+    // Si ce n'est pas encore un MP4 direct, tenter d'extraire le stream direct (MP4 prioritaire)
     if (directType !== 'mp4' && downloadUrl) {
       try {
         const direct = await DirectScraper.resolve(downloadUrl, false);
-        if (direct?.directUrl && direct.type === 'mp4') {
+        if (direct?.directUrl) {
           downloadUrl = direct.directUrl;
-          directType = 'mp4';
-          console.log(`[Download Resolve] ✅ MP4 direct extrait avec succès pour download: ${downloadUrl.slice(0, 80)}...`);
+          directType = direct.type === 'hls' || /\.m3u8/i.test(direct.directUrl) ? 'hls' : 'mp4';
+          console.log(`[Download Resolve] ✅ ${directType.toUpperCase()} direct extrait avec succès pour download: ${downloadUrl.slice(0, 80)}...`);
         }
       } catch (err: any) {
-        console.warn(`[Download Resolve] Échec extraction MP4 direct:`, err.message);
+        console.warn(`[Download Resolve] Échec extraction direct:`, err.message);
       }
     }
 
@@ -201,8 +203,9 @@ router.get('/resolve', async (req: Request, res: Response) => {
       .replace(/\s+/g, ' ');
     const cleanFilename = `${safeTitle}${isTv ? `_S${season || 1}E${episode || 1}` : ''}.mp4`;
 
-    const isHls = directType === 'hls' || /\.m3u8(\?|$)/i.test(downloadUrl);
-    const isMp4Direct = directType === 'mp4' || /\.mp4(\?|$)/i.test(downloadUrl);
+    const isHtml = /\.html?(\?|$)/i.test(downloadUrl) || downloadUrl.includes('/embed-') || downloadUrl.includes('/e/');
+    const isHls = (directType === 'hls' || /\.m3u8(\?|$)/i.test(downloadUrl)) && !isHtml;
+    const isMp4Direct = (directType === 'mp4' || /\.mp4(\?|$)/i.test(downloadUrl)) && !isHtml;
 
     let finalDownloadUrl: string;
 
@@ -318,6 +321,12 @@ async function serveFileProxy(
     });
   } catch (error: any) {
     console.error('[Download File Proxy] Amont injoignable:', error.message);
+    return false;
+  }
+
+  const upstreamContentType = String(response.headers['content-type'] || '').toLowerCase();
+  if (upstreamContentType.includes('text/html')) {
+    console.warn(`[Download File Proxy] ⚠️ L'amont a renvoyé du HTML (text/html) au lieu d'un fichier binaire pour: ${url}`);
     return false;
   }
 

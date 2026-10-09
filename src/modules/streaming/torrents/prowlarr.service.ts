@@ -163,41 +163,49 @@ export async function resolveTorrentLink(
   item: TorrentCandidate,
   redirects = 5
 ): Promise<{ kind: 'link' | 'file'; data: string }> {
+  // 1. Si on a déjà un magnet natif
   if (item.magnet && item.magnet.startsWith('magnet:')) {
     return { kind: 'link', data: item.magnet };
   }
-  const url = item.magnet || item.downloadUrl;
-  if (!url) {
-    if (item.infoHash && /^[0-9a-f]{40}$/i.test(item.infoHash)) {
-      return { kind: 'link', data: buildMagnetFromHash(item.infoHash, item.title) };
+
+  // 2. Préférer le téléchargement du fichier .torrent via downloadUrl
+  // (Prowlarr fournit un lien HTTP de download valide vers le tracker avec le fichier binaire)
+  const url = item.downloadUrl || (item.magnet && item.magnet.startsWith('http') ? item.magnet : undefined);
+
+  if (url) {
+    try {
+      const response = await axios.get(fixProwlarrUrl(url), {
+        maxRedirects: 0,
+        validateStatus: (status) => status >= 200 && status < 400,
+        responseType: 'arraybuffer',
+        timeout: 15000,
+      });
+
+      if (response.status >= 300 && response.status < 400 && response.headers.location) {
+        const location = String(response.headers.location);
+        if (location.startsWith('magnet:')) return { kind: 'link', data: location };
+        return resolveTorrentLink({ ...item, downloadUrl: location, magnet: undefined }, redirects - 1);
+      }
+
+      const contentType = String(response.headers['content-type'] || '');
+      if (
+        response.data &&
+        response.data.byteLength > 0 &&
+        !contentType.includes('application/json') &&
+        !contentType.includes('text/html')
+      ) {
+        return { kind: 'file', data: Buffer.from(response.data).toString('base64') };
+      }
+    } catch (err: any) {
+      console.warn(`[Torrents] Échec téléchargement .torrent (${err?.message || err})`);
     }
-    throw new Error('Résultat sans lien téléchargeable');
   }
-  if (redirects <= 0) throw new Error('Trop de redirections pour résoudre le lien');
 
-  try {
-    const response = await axios.get(fixProwlarrUrl(url), {
-      maxRedirects: 0,
-      validateStatus: (status) => status >= 200 && status < 400,
-      responseType: 'arraybuffer',
-      timeout: 15000,
-    });
-
-    if (response.status >= 300 && response.status < 400 && response.headers.location) {
-      const location = String(response.headers.location);
-      if (location.startsWith('magnet:')) return { kind: 'link', data: location };
-      return resolveTorrentLink({ ...item, magnet: location, downloadUrl: undefined }, redirects - 1);
-    }
-
-    return { kind: 'file', data: Buffer.from(response.data).toString('base64') };
-  } catch (err: any) {
-    // Si le téléchargement du .torrent échoue (ex: 404 YTS/Prowlarr) mais qu'on a le hash :
-    if (item.infoHash && /^[0-9a-f]{40}$/i.test(item.infoHash)) {
-      console.warn(
-        `[Torrents] Échec téléchargement .torrent (${err?.message || err}), repli sur magnet direct depuis infoHash: ${item.infoHash}`
-      );
-      return { kind: 'link', data: buildMagnetFromHash(item.infoHash, item.title) };
-    }
-    throw err;
+  // 3. Fallback immédiat et inconditionnel : si on a un infoHash, construire le lien magnet direct
+  if (item.infoHash && /^[0-9a-f]{40}$/i.test(item.infoHash)) {
+    console.log(`[Torrents] ✅ Utilisation du lien magnet direct depuis infoHash: ${item.infoHash}`);
+    return { kind: 'link', data: buildMagnetFromHash(item.infoHash, item.title) };
   }
+
+  throw new Error('Résultat sans lien téléchargeable ni infoHash');
 }
