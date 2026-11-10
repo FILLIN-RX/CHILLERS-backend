@@ -1,332 +1,450 @@
-import { chromium, Browser, Page } from 'playwright';
-import { browserConfig } from '../../config/browser';
+import axios from 'axios';
 import Movie from '../../models/Movie';
 import Serie from '../../models/Serie';
 
 const BASE_URL = 'https://www.open-otaku.me';
 
-let browser: Browser | null = null;
 let scrapeInProgress = false;
 
-async function getBrowser(): Promise<Browser> {
-  if (!browser || !browser.isConnected()) {
-    browser = await chromium.launch(browserConfig);
-  }
-  return browser;
+function cleanTitle(s: string): string {
+  return (s || '')
+    .toLowerCase()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/\b(saison|season)\s*\d+/gi, '')
+    .replace(/\b(19\d\d|20\d\d)\b/g, '')
+    .replace(/[^a-z0-9]/g, '')
+    .trim();
+}
+
+function areTitlesMatching(searchTitle: string, candidateTitle: string): boolean {
+  const s = cleanTitle(searchTitle);
+  const c = cleanTitle(candidateTitle);
+  if (!s || !c) return false;
+  if (s === c) return true;
+  if (c.startsWith(s) && (c.length - s.length <= 15)) return true;
+  if (s.startsWith(c) && (s.length - c.length <= 10)) return true;
+  if (c.includes(s) || s.includes(c)) return true;
+  return false;
+}
+
+function cleanSearchQuery(q: string): string {
+  if (!q) return '';
+  return q
+    .replace(/[?!,;:#~"'\(\)\[\]{}*_\\\/]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
 }
 
 function normalize(str: string): string {
   return str.toLowerCase().replace(/[^a-z0-9]/g, '').slice(0, 20);
 }
 
-export interface OtakuResult {
-  titre: string;
-  lien: string;
-  source: 'otaku';
+function toDownloadUrl(url: string): string {
+  if (!url) return '';
+  if (url.includes('vidzy.')) return url.replace('/embed-', '/d/').replace('.html', '_n.html');
+  if (url.includes('luluvid.')) return url.replace('/embed-', '/d/').replace('.html', '');
+  return url;
 }
 
-export async function searchOtaku(title: string, type: 'movie' | 'series' = 'movie'): Promise<OtakuResult | null> {
-  const b = await getBrowser();
-  const page = await b.newPage();
-
-  try {
-    // Navigate to search page
-    const searchUrl = type === 'series'
-      ? `${BASE_URL}/?cat=series`
-      : `${BASE_URL}/`;
-
-    console.log(`[Otaku] Searching "${title}" on ${searchUrl}`);
-    await page.goto(searchUrl, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2000);
-
-    // Click search button
-    const searchBtn = page.locator('#fs-search-icon-btn');
-    if (await searchBtn.count() > 0) {
-      await searchBtn.click();
-      await page.waitForTimeout(1000);
-    }
-
-    // Type in search input
-    const searchInput = page.locator('input[type="search"], input[type="text"], #fs-search-input, .fs-search-input');
-    if (await searchInput.count() > 0) {
-      await searchInput.first().fill(title);
-      await page.keyboard.press('Enter');
-      await page.waitForTimeout(3000);
-    } else {
-      // Try URL-based search
-      await page.goto(`${BASE_URL}/?s=${encodeURIComponent(title)}`, { waitUntil: 'domcontentloaded', timeout: 30000 });
-      await page.waitForTimeout(3000);
-    }
-
-    // Find cards in results
-    const cards = await page.locator('.fs-card').all();
-    if (cards.length === 0) {
-      console.log(`[Otaku] No results for "${title}"`);
-      return null;
-    }
-
-    // Find best match
-    let bestCard = cards[0];
-    let bestScore = 0;
-    const searchNorm = normalize(title);
-
-    for (const card of cards) {
-      const cardTitle = await card.locator('.fs-card-title').innerText().catch(() => '');
-      const cardNorm = normalize(cardTitle);
-      if (cardNorm === searchNorm || cardNorm.includes(searchNorm) || searchNorm.includes(cardNorm)) {
-        bestCard = card;
-        bestScore = 1;
-        break;
-      }
-      // Partial match
-      if (cardNorm.slice(0, 10) === searchNorm.slice(0, 10)) {
-        bestCard = card;
-        bestScore = 0.5;
-      }
-    }
-
-    if (bestScore === 0) {
-      console.log(`[Otaku] No close match for "${title}", using first result`);
-    }
-
-    // Supprimer la popup don qui bloque le clic
-    await page.evaluate(() => {
-        document.querySelector('#fs-donate-overlay')?.remove();
-    }).catch(() => {});
-
-    await page.waitForTimeout(500);
-    // Supprimer la popup don à nouveau (elle peut réapparaître)
-    await page.evaluate(() => {
-        document.querySelector('#fs-donate-overlay')?.remove();
-    }).catch(() => {});
-
-    // Click on best card (force: true pour ignorer les overlays)
-    await bestCard.click({ force: true });
-    await page.waitForLoadState('domcontentloaded');
-    await page.waitForTimeout(2000);
-
-    // Get title from detail page
-    const detailTitle = await page.locator('.fs-card-title, h1, h2').first().innerText().catch(() => title);
-
-    if (type === 'series') {
-      // Series: get first episode download link
-      const link = await extractEpisodeDownload(page);
-      if (link) {
-        return { titre: detailTitle, lien: link, source: 'otaku' };
-      }
-    } else {
-      // Movie: get download link
-      const link = await extractMovieDownload(page);
-      if (link) {
-        return { titre: detailTitle, lien: link, source: 'otaku' };
-      }
-    }
-
-    console.log(`[Otaku] No download link found for "${title}"`);
-    return null;
-  } catch (err: any) {
-    console.error(`[Otaku] Error searching "${title}":`, err.message);
-    return null;
-  } finally {
-    await page.close();
-  }
+async function sleep(ms: number) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function extractMovieDownload(page: Page): Promise<string | null> {
-  try {
-    // Click download button
-    const dlBtn = page.locator('button#fs-quick-download, .fs-download-btn, button:has-text("Download")');
-    if (await dlBtn.count() > 0) {
-      await dlBtn.first().click({ force: true });
-      await page.waitForTimeout(8000);
-
-      // Extract link
-      const dlLink = page.locator('a#fs-dl-link, a[href*="vidzy"], a[href*="doodstream"], a[href*=".mp4"]');
-      if (await dlLink.count() > 0) {
-        const href = await dlLink.first().getAttribute('href');
-        if (href && href !== '#') return href;
-      }
-    }
-
-    // Fallback: try to find any direct link
-    const allLinks = await page.locator('a[href]').all();
-    for (const link of allLinks) {
-      const href = await link.getAttribute('href');
-      if (href && (href.includes('.mp4') || href.includes('vidzy') || href.includes('doodstream'))) {
-        return href;
-      }
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function extractEpisodeDownload(page: Page): Promise<string | null> {
-  try {
-    // Click download button
-    const dlBtn = page.locator('button#fs-quick-download, .fs-download-btn');
-    if (await dlBtn.count() > 0) {
-      await dlBtn.first().click({ force: true });
-      await page.waitForTimeout(8000);
-
-      // Extract link
-      const dlLink = page.locator('a#fs-dl-link, a[href*="vidzy"], a[href*="doodstream"], a[href*=".mp4"]');
-      if (await dlLink.count() > 0) {
-        const href = await dlLink.first().getAttribute('href');
-        if (href && href !== '#') return href;
-      }
-    }
-
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-export async function searchAndNavigateToSeries(page: Page, title: string): Promise<boolean> {
-  try {
-    console.log(`[Otaku] Navigating to series: "${title}" via UI search`);
-
-    // 1. Go to homepage
-    await page.goto(BASE_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.waitForTimeout(2000);
-
-    // 2. Click search button
-    const searchBtn = page.locator('#fs-search-icon-btn');
-    if (await searchBtn.count() > 0) {
-      await searchBtn.click();
-      await page.waitForTimeout(1000);
-    }
-
-    // 3. Type in search input and press Enter
-    const searchInput = page.locator('input[type="search"], input[type="text"], #fs-search-input, .fs-search-input');
-    if (await searchInput.count() > 0) {
-      await searchInput.first().fill(title);
-      await page.keyboard.press('Enter');
-      await page.waitForTimeout(4000); // Wait for results
-    } else {
-        console.log("[Otaku] Search input not found");
-        return false;
-    }
-
-    // 4. Find cards and click best match
-    const cards = await page.locator('.fs-card').all();
-    if (cards.length === 0) {
-      console.log(`[Otaku] No results for "${title}"`);
-      return false;
-    }
-
-    // Simple matching to find the best card
-    let targetCard = cards[0];
-    for (const card of cards) {
-      const cardTitle = await card.locator('.fs-card-title').innerText().catch(() => '');
-      if (cardTitle.toLowerCase().includes(title.toLowerCase())) {
-        targetCard = card;
-        break;
-      }
-    }
-
-    await targetCard.click();
-    await page.waitForLoadState('domcontentloaded');
-    await page.waitForTimeout(2000);
-
-    return true;
-  } catch (err) {
-    console.error(`[Otaku] Error navigating to "${title}":`, err);
-    return false;
-  }
-}
-
-export async function getSpecificEpisodeLink(page: Page, episodeNumber: string, previousLink?: string | null): Promise<string | null> {
-  const maxRetries = 2;
-
-  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+async function fetchWithRetry(url: string, params: any, retries = 3, delayMs = 3000): Promise<any> {
+  for (let attempt = 1; attempt <= retries; attempt++) {
     try {
-      // 1. Attendre que le select ait au moins une option
-      await page.waitForFunction(() => {
-        const s = document.querySelector('#fs-episode-select') as HTMLSelectElement;
-        return s && s.options && s.options.length > 0;
-      }, { timeout: 15000 });
-
-      // 2. Sélectionner l'épisode dans la liste
-      const optionFound = await page.evaluate((epNum) => {
-          const select = document.querySelector('#fs-episode-select') as HTMLSelectElement;
-          const option = Array.from(select.options).find(o => o.text.trim().includes('Ép ' + epNum));
-          if (option) {
-              select.value = option.value;
-              select.dispatchEvent(new Event('change'));
-              return true;
-          }
-          return false;
-      }, episodeNumber);
-
-      if (!optionFound) {
-        const texts = await page.evaluate(() => {
-          const s = document.querySelector('#fs-episode-select') as HTMLSelectElement | null;
-          return s ? Array.from(s.options, o => o.text) : [];
-        });
-        console.log(`[Otaku] Épisode "${episodeNumber}" non trouvé. Options: ${JSON.stringify(texts)}`);
-        return null;
-      }
-
-      // 3. Attendre que le contenu se mette à jour
-      await page.waitForTimeout(3000);
-
-      // 4. Cliquer sur téléchargement
-      const dlBtn = page.locator('button#fs-quick-download, .fs-download-btn, button:has-text("Download")');
-      if (await dlBtn.count() > 0) {
-          await dlBtn.first().click({ force: true });
-      } else {
-          console.log("[Otaku] Bouton de téléchargement introuvable.");
-          if (attempt < maxRetries) {
-            await page.reload({ waitUntil: 'domcontentloaded' });
-            await page.waitForTimeout(2000);
-            continue;
-          }
-          return null;
-      }
-
-      // 5. Attendre un lien valide ET différent du précédent (évite les liens périmés)
-      try {
-        await page.waitForFunction((prevLink) => {
-            const a = document.querySelector('a#fs-dl-link, a[href*="vidzy"], a[href*="doodstream"]');
-            if (!a) return false;
-            const href = a.getAttribute('href');
-            return href !== null && href !== '#' && href.length > 10 && href !== prevLink;
-        }, previousLink ?? null, { timeout: 30000 });
-      } catch {
-        console.log(`[Otaku] Timeout en attente du lien pour épisode ${episodeNumber}`);
-        if (attempt < maxRetries) {
-          await page.reload({ waitUntil: 'domcontentloaded' });
-          await page.waitForTimeout(2000);
-          continue;
-        }
-        return null;
-      }
-
-      // 6. Récupérer le lien
-      const dlLink = page.locator('a#fs-dl-link, a[href*="vidzy"], a[href*="doodstream"]');
-      if (await dlLink.count() > 0) {
-          const href = await dlLink.first().getAttribute('href');
-          if (href && href !== '#') return href;
-      }
-
-      if (attempt < maxRetries) {
-        await page.reload({ waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(2000);
-      }
-    } catch (err) {
-      console.error(`[Otaku] Erreur (tentative ${attempt}) pour épisode ${episodeNumber}:`, err);
-      if (attempt < maxRetries) {
-        await page.reload({ waitUntil: 'domcontentloaded' });
-        await page.waitForTimeout(2000);
+      const { data } = await axios.get(url, {
+        params,
+        timeout: 20000,
+        headers: { 'User-Agent': 'Mozilla/5.0' },
+      });
+      return data;
+    } catch (err: any) {
+      const is429 = err?.response?.status === 429 || err?.message?.includes('429');
+      if (is429 && attempt < retries) {
+        const wait = delayMs * attempt;
+        console.log(`[Otaku Service] [429 RateLimit] Pause ${wait / 1000}s avant retry...`);
+        await sleep(wait);
         continue;
       }
+      if (attempt === retries) throw err;
+      await sleep(1000 * attempt);
     }
   }
   return null;
+}
+
+export async function getOtakuDirectLink(embedUrl: string): Promise<string | null> {
+  return getDirectLink(embedUrl);
+}
+
+export async function getDirectLink(embedUrl: string): Promise<string | null> {
+  try {
+    const dlUrl = toDownloadUrl(embedUrl);
+    if (!dlUrl) return null;
+    const data = await fetchWithRetry(`${BASE_URL}/api/dl`, { url: dlUrl });
+    return data?.success && data?.downloadUrl ? data.downloadUrl : null;
+  } catch {
+    return null;
+  }
+}
+
+export interface OtakuResult {
+  titre: string;
+  lien: string;
+  downloadUrl?: string;
+  pagePath?: string;
+  source: 'otaku';
+}
+
+export async function searchOtaku(
+  title: string,
+  type: 'movie' | 'series' = 'movie',
+  season?: number,
+  episode?: number,
+  language: string = 'fr',
+  year?: number,
+  knownPageId?: string,
+  originalTitle?: string
+): Promise<OtakuResult | null> {
+  try {
+    const targetSeason = season && season > 0 ? season : 1;
+    const targetEpisode = episode && episode > 0 ? episode : 1;
+    const labelSeasonEp = type === 'series' ? ` S${targetSeason}E${targetEpisode}` : '';
+    console.log(`[Otaku Direct API] Searching "${title}"${labelSeasonEp} (type: ${type}, year: ${year || 'non spécifiée'}, lang: ${language}, knownId: ${knownPageId || 'aucun'})`);
+
+    let bestItem: { id: string; title: string; poster?: string } | null = null;
+    let watch: any = null;
+
+    // 1. Tenter un chargement direct sans recherche si un identifiant/pageId est déjà connu en DB
+    if (knownPageId) {
+      console.log(`[Otaku] [Direct Cache] Tentative directe sur ID mémorisé: "${knownPageId}"`);
+      try {
+        const directWatch = await fetchWithRetry(`${BASE_URL}/api/fs-watch`, { id: knownPageId });
+        if (directWatch && (directWatch.episodes || directWatch.players)) {
+          watch = directWatch;
+          bestItem = { id: knownPageId, title: directWatch?.meta?.title || title };
+          console.log(`[Otaku] [Direct Cache] Succès direct sur ID "${knownPageId}" sans recherche !`);
+        } else {
+          console.log(`[Otaku] [Direct Cache] ID mémorisé sans données valides, bascule vers recherche.`);
+        }
+      } catch (err: any) {
+        console.warn(`[Otaku] [Direct Cache] Échec ID mémorisé (${err.message}), fallback recherche.`);
+      }
+    }
+
+    // 2. Si pas d'ID mémorisé ou échec, faire la recherche classique
+    if (!watch || !bestItem) {
+      // Recherche directe via l'API interne d'OpenOtaku
+      // Si série avec saison > 1 et titre ne contenant pas "saison", tenter d'abord avec le libellé saison
+      let queryTitle = title;
+      if (type === 'series' && targetSeason > 1 && !/saison\s*\d+/i.test(title)) {
+        queryTitle = `${title} Saison ${targetSeason}`;
+      }
+
+      const cleanQ = cleanSearchQuery(queryTitle);
+      let data = await fetchWithRetry(`${BASE_URL}/api/fs-search`, { q: cleanQ || queryTitle });
+      let results: Array<{ id: string; title: string; poster?: string }> = data?.results || [];
+
+      // Fallback recherche avec titre brut si aucun résultat avec le suffixe saison
+      if (results.length === 0 && queryTitle !== title) {
+        const cleanRaw = cleanSearchQuery(title);
+        data = await fetchWithRetry(`${BASE_URL}/api/fs-search`, { q: cleanRaw || title });
+        results = data?.results || [];
+      }
+
+      // Fallback avec titre original (VO) si aucun résultat
+      if (results.length === 0 && originalTitle && cleanTitle(originalTitle) !== cleanTitle(title)) {
+        const cleanOrig = cleanSearchQuery(originalTitle);
+        console.log(`[Otaku] Aucun résultat pour "${title}", tentative avec titre original "${originalTitle}"`);
+        data = await fetchWithRetry(`${BASE_URL}/api/fs-search`, { q: cleanOrig || originalTitle });
+        results = data?.results || [];
+      }
+
+      if (results.length === 0) {
+        console.log(`[Otaku] Aucun résultat trouvé pour "${title}"`);
+        return null;
+      }
+
+      // Trouver la meilleure correspondance de titre
+      const matchingItems: Array<{ id: string; title: string; poster?: string }> = [];
+
+      for (const item of results) {
+        if (
+          areTitlesMatching(queryTitle, item.title || '') ||
+          areTitlesMatching(title, item.title || '') ||
+          (originalTitle && areTitlesMatching(originalTitle, item.title || ''))
+        ) {
+          matchingItems.push(item);
+        }
+      }
+
+      // Si aucune correspondance sur les résultats mais qu'un titre original existe, tenter une recherche directe VO
+      if (matchingItems.length === 0 && originalTitle && cleanTitle(originalTitle) !== cleanTitle(title)) {
+        console.log(`[Otaku] Correspondance éloignée pour "${title}", recherche avec titre original "${originalTitle}"...`);
+        const cleanOrig = cleanSearchQuery(originalTitle);
+        const origData = await fetchWithRetry(`${BASE_URL}/api/fs-search`, { q: cleanOrig || originalTitle });
+        const origResults: Array<{ id: string; title: string; poster?: string }> = origData?.results || [];
+        for (const item of origResults) {
+          if (areTitlesMatching(originalTitle, item.title || '') || areTitlesMatching(title, item.title || '')) {
+            matchingItems.push(item);
+          }
+        }
+      }
+
+      if (matchingItems.length === 0) {
+        console.log(`[Otaku] Correspondance trop éloignée pour "${title}" (trouvé: "${results[0]?.title}"), skip.`);
+        return null;
+      }
+
+      bestItem = matchingItems[0];
+
+      // Pour les séries, cibler la saison demandée
+      if (type === 'series' && matchingItems.length > 1) {
+        const qLower = (title || '').toLowerCase();
+        const nonBonus = matchingItems.filter((it) => {
+          const t = (it.title || '').toLowerCase();
+          if (!qLower.includes('bonus') && t.includes('bonus')) return false;
+          if (!qLower.includes('special') && !qLower.includes('spécial') && (t.includes('special') || t.includes('spécial'))) return false;
+          if (!qLower.includes('recap') && !qLower.includes('récap') && (t.includes('recap') || t.includes('récap'))) return false;
+          return true;
+        });
+        const candidates = nonBonus.length > 0 ? nonBonus : matchingItems;
+
+        const seasonRegex = new RegExp(`saison\\s*0*${targetSeason}\\b|season\\s*0*${targetSeason}\\b|s0*${targetSeason}\\b`, 'i');
+        const exactSeason = candidates.find((it) => seasonRegex.test(it.title || ''));
+        if (exactSeason) {
+          bestItem = exactSeason;
+          console.log(`[Otaku] Match exact saison ${targetSeason} trouvé: "${bestItem.title}"`);
+        } else if (targetSeason === 1) {
+          const s1Item = candidates.find((it) => /saison\s*1\b|season\s*1\b/i.test(it.title || '') || !/saison\s*\d+/i.test(it.title || ''));
+          if (s1Item) {
+            bestItem = s1Item;
+            console.log(`[Otaku] Match saison 1 par défaut: "${bestItem.title}"`);
+          }
+        }
+      }
+
+      // Si une année est spécifiée pour un film, inspecter les métadonnées pour valider l'année
+      // — même avec un seul candidat, pour éviter les homonymes (ex: "The Odyssey" 1997 vs 2024)
+      if (type === 'movie' && year) {
+        const candidatesToCheck = matchingItems.slice(0, 4);
+        let yearMatchFound = false;
+        for (const cand of candidatesToCheck) {
+          const w = await fetchWithRetry(`${BASE_URL}/api/fs-watch`, { id: cand.id });
+          if (w?.meta?.year) {
+            const candYear = parseInt(w.meta.year, 10);
+            if (!isNaN(candYear) && Math.abs(candYear - year) <= 1) {
+              bestItem = cand;
+              watch = w;
+              yearMatchFound = true;
+              console.log(`[Otaku] Match exact année trouvé: "${cand.title}" (ID: ${cand.id}, Année: ${candYear}) pour cible ${year}`);
+              break;
+            } else if (!isNaN(candYear)) {
+              console.log(`[Otaku] Candidat "${cand.title}" rejeté : année ${candYear} ≠ cible ${year}`);
+            }
+          } else if (candidatesToCheck.length === 1) {
+            // Seul candidat sans métadonnée d'année : on le garde en dernier recours
+            bestItem = cand;
+            watch = w;
+          }
+        }
+        // Si aucun candidat ne correspond à l'année et qu'il y en a plusieurs,
+        // on rejette plutôt que de servir le mauvais film
+        if (!yearMatchFound && matchingItems.length > 1) {
+          console.log(`[Otaku] Aucun candidat avec l'année ${year} parmi ${matchingItems.length} résultats pour "${title}", skip.`);
+          return null;
+        }
+      }
+
+      // Pour une série, le 1er candidat matché peut être un FILM homonyme (ex:
+      // "Black Clover : L'épée de l'empereur-mage" pour la série "Black Clover").
+      // On parcourt alors les candidats et on retient le premier qui expose
+      // réellement des épisodes, au lieu d'abandonner sur le film.
+      if (type === 'series' && bestItem) {
+        const preferredId = bestItem.id;
+        const ordered = [
+          bestItem,
+          ...matchingItems.filter((it) => it.id !== preferredId),
+        ];
+        for (const cand of ordered) {
+          const w = await fetchWithRetry(`${BASE_URL}/api/fs-watch`, { id: cand.id });
+          const eps = w?.episodes || {};
+          const hasEpisodes =
+            Object.keys(eps.vf || {}).length > 0 || Object.keys(eps.vostfr || {}).length > 0;
+          if (hasEpisodes) {
+            // Si une année est demandée, rejeter les homonymes dont l'année diverge (ex: live action 2023 pour animé 1999)
+            if (year && w?.meta?.year) {
+              const candYear = parseInt(w.meta.year, 10);
+              if (!isNaN(candYear) && Math.abs(candYear - year) > 3) {
+                console.log(`[Otaku] Candidat "${cand.title}" rejeté : année ${candYear} trop éloignée de l'année cible ${year}`);
+                continue;
+              }
+            }
+            bestItem = cand;
+            watch = w;
+            console.log(`[Otaku] Candidat série avec épisodes retenu: "${cand.title}" (ID: ${cand.id})`);
+            break;
+          }
+        }
+      }
+
+      // Récupérer les détails de visionnage si pas déjà récupérés
+      if (!watch && bestItem) {
+        watch = await fetchWithRetry(`${BASE_URL}/api/fs-watch`, { id: bestItem.id });
+      }
+    }
+
+    if (!bestItem || !watch) {
+      return null;
+    }
+
+    const savedPageId = bestItem.id;
+
+    const detailTitle = watch?.meta?.title || bestItem.title || title;
+
+    if (type === 'series') {
+      const rawEps = watch?.episodes || {};
+      const vfMap = rawEps.vf || {};
+      const vostfrMap = rawEps.vostfr || {};
+      let version = vfMap;
+      if (language === 'vostfr') {
+        version = Object.keys(vostfrMap).length > 0 ? vostfrMap : vfMap;
+      } else {
+        version = Object.keys(vfMap).length > 0 ? vfMap : vostfrMap;
+      }
+      
+      // Chercher l'épisode demandé dans la langue préférée puis dans l'autre.
+      // Ne jamais retomber sur le premier épisode : cela servirait un mauvais épisode.
+      const episodeMaps = language.toLowerCase() === 'vostfr'
+        ? [vostfrMap, vfMap]
+        : [vfMap, vostfrMap];
+      const epKey = String(targetEpisode);
+      const epPadded = String(targetEpisode).padStart(2, '0');
+      let matchedKey: string | undefined;
+      let players: any;
+      for (const episodeMap of episodeMaps) {
+        matchedKey = Object.keys(episodeMap).find((key) => {
+          const normalizedKey = key.trim();
+          return normalizedKey === epKey || normalizedKey === epPadded || (/^\d+$/.test(normalizedKey) && Number(normalizedKey) === targetEpisode);
+        });
+        if (matchedKey) {
+          players = episodeMap[matchedKey] || {};
+          break;
+        }
+      }
+
+      if (!matchedKey) {
+        console.log(`[Otaku] Aucun épisode trouvé dans la liste pour "${title}" S${targetSeason}E${targetEpisode}`);
+        return null;
+      }
+
+      const embedUrl = players.vidzy || players.luluvid || (Object.values(players)[0] as string) || '';
+      
+      if (embedUrl) {
+        const link = await getDirectLink(embedUrl);
+        if (link) {
+          console.log(`[Otaku] Épisode S${targetSeason}E${targetEpisode} résolu (${matchedKey}): ${link.slice(0, 60)}...`);
+          return { titre: detailTitle, lien: link, pagePath: savedPageId, source: 'otaku' };
+        }
+        // Si le lien direct n'a pas pu être extrait, renvoyer l'embedUrl
+        return { titre: detailTitle, lien: embedUrl, pagePath: savedPageId, source: 'otaku' };
+      }
+    } else {
+      const players = watch?.players || {};
+      let embedUrl = '';
+      if (language === 'vostfr') {
+        embedUrl =
+          players.vidzy?.vostfr ||
+          players.vidzy?.default ||
+          players.premium?.default ||
+          '';
+      } else {
+        embedUrl =
+          players.vidzy?.vff ||
+          players.vidzy?.vf ||
+          players.vidzy?.default ||
+          players.premium?.default ||
+          '';
+      }
+
+      if (!embedUrl) {
+        embedUrl =
+          players.vidzy?.default ||
+          players.vidzy?.vff ||
+          players.vidzy?.vf ||
+          players.vidzy?.vostfr ||
+          players.premium?.default ||
+          (Object.values(players)[0] as any)?.default ||
+          '';
+      }
+
+      if (embedUrl) {
+        const link = await getDirectLink(embedUrl);
+        if (link) {
+          return { titre: detailTitle, lien: link, pagePath: savedPageId, source: 'otaku' };
+        }
+        return { titre: detailTitle, lien: embedUrl, pagePath: savedPageId, source: 'otaku' };
+      }
+    }
+
+    console.log(`[Otaku] Lien direct non trouvé pour "${title}"`);
+    return null;
+  } catch (err: any) {
+    console.error(`[Otaku] Erreur recherche API pour "${title}":`, err.message);
+    return null;
+  }
+}
+
+export async function getSpecificEpisodeLink(
+  page: any,
+  episodeNumber: string,
+  previousLink?: string | null,
+  seriesIdOrTitle?: string
+): Promise<string | null> {
+  try {
+    const targetTitle = seriesIdOrTitle || (page?.url ? new URL(page.url()).searchParams.get('watch_fs') : null);
+    if (!targetTitle) return null;
+
+    let fsId = targetTitle;
+    if (isNaN(Number(targetTitle))) {
+      const { data } = await axios.get(`${BASE_URL}/api/fs-search`, {
+        params: { q: targetTitle },
+        timeout: 10000,
+        headers: { 'User-Agent': 'Mozilla/5.0' }
+      });
+      fsId = data?.results?.[0]?.id;
+    }
+
+    if (!fsId) return null;
+
+    const { data: watch } = await axios.get(`${BASE_URL}/api/fs-watch`, {
+      params: { id: fsId },
+      timeout: 10000,
+      headers: { 'User-Agent': 'Mozilla/5.0' }
+    });
+
+    const rawEps = watch?.episodes || {};
+    const vfMap = rawEps.vf || {};
+    const vostfrMap = rawEps.vostfr || {};
+    const version = Object.keys(vfMap).length > 0 ? vfMap : vostfrMap;
+    const epNumOnly = episodeNumber.replace(/\D/g, '') || '1';
+    const players = version[epNumOnly] || Object.values(version)[0] || {};
+    const embedUrl = (players as any).vidzy || (players as any).luluvid || (Object.values(players)[0] as string) || '';
+
+    if (embedUrl) {
+      return await getDirectLink(embedUrl);
+    }
+    return null;
+  } catch (err: any) {
+    console.error(`[Otaku] Erreur getSpecificEpisodeLink:`, err.message);
+    return null;
+  }
+}
+
+export async function searchAndNavigateToSeries(page: any, title: string): Promise<boolean> {
+  return true;
 }
 
 export async function searchAndCache(
@@ -334,7 +452,7 @@ export async function searchAndCache(
   type: 'movie' | 'series' = 'movie'
 ): Promise<OtakuResult | null> {
   if (scrapeInProgress) {
-    console.log(`[Otaku] Scrape already in progress, skipping "${title}"`);
+    console.log(`[Otaku] Scrape déjà en cours, skip "${title}"`);
     return null;
   }
 
@@ -347,20 +465,20 @@ export async function searchAndCache(
         if (!existing) {
           await Serie.create({
             titre: result.titre,
-            pageUrl: '', // Will be filled by maintenance
+            pageUrl: '',
             episodes: [{ episode: 'Ép 1', lien: result.lien }]
           });
-          console.log(`[Otaku] Cached Series: ${result.titre}`);
+          console.log(`[Otaku] Série mise en cache : ${result.titre}`);
         }
       } else {
         const existing = await Movie.findOne({ titre: result.titre });
         if (!existing) {
           await Movie.create({
             titre: result.titre,
-            pageUrl: '', // Will be filled by maintenance
+            pageUrl: '',
             lien: result.lien
           });
-          console.log(`[Otaku] Cached Movie: ${result.titre}`);
+          console.log(`[Otaku] Film mis en cache : ${result.titre}`);
         }
       }
     }
