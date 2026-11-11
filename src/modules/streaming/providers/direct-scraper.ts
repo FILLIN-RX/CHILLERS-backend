@@ -25,7 +25,7 @@ function isDirectVideoUrl(url: string): boolean {
 }
 
 function isVidzyUrl(url: string): boolean {
-  return /(?:[a-z0-9]+\.)?vidzy\.(?:cc|org|xyz|co|tv|top|to)\//i.test(url);
+  return /(?:[a-z0-9]+\.)?vidzy\.(?:cc|org|xyz|co|tv|top|to|live|net|me|io|app|pro|site|online|stream|vip|fun|club|one|info)\//i.test(url);
 }
 
 /**

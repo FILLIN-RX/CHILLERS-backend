@@ -150,7 +150,7 @@ export class FrenchStreamProvider implements StreamingProvider {
         } catch (_) {}
       }
 
-      const isDirectStream = /\.(mp4|webm|mkv|m3u8)(\?|$)/i.test(directStreamUrl) || /u\d+\.vidzy\.cc/i.test(directStreamUrl);
+      const isDirectStream = /\.(mp4|webm|mkv|m3u8)(\?|$)/i.test(directStreamUrl) || /u\d+\.vidzy\./i.test(directStreamUrl);
       // Priorité : referer du scraper (URL embed) > referer générique par domaine
       const referer = directReferer || getRefererForStreamUrl(directStreamUrl);
 
@@ -279,7 +279,7 @@ export class FrenchStreamProvider implements StreamingProvider {
         } catch (_) {}
       }
 
-      const isDirectStream = /\.(mp4|webm|mkv|m3u8)(\?|$)/i.test(directStreamUrl) || /u\d+\.vidzy\.cc/i.test(directStreamUrl);
+      const isDirectStream = /\.(mp4|webm|mkv|m3u8)(\?|$)/i.test(directStreamUrl) || /u\d+\.vidzy\./i.test(directStreamUrl);
       // Priorité : referer du scraper (URL embed) > referer générique par domaine
       const referer = directReferer || getRefererForStreamUrl(directStreamUrl);
 
