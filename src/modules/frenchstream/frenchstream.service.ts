@@ -365,8 +365,10 @@ function isCandidateMatching(candidateTitle: string, titles: string[]): boolean 
     const norm = normalize(t);
     if (!norm) continue;
     if (normCand === norm) return true;
-    if (normCand.startsWith(norm) || norm.startsWith(normCand)) return true;
-    if (normCand.includes(norm) || norm.includes(normCand)) return true;
+    // Tolérer uniquement un suffixe d'année ou de saison collé :
+    // "sherlock2024" correspond à "sherlock", mais "sherlockdaughter" ne correspond pas.
+    if (normCand.startsWith(norm) && /^\d{0,4}$/.test(normCand.slice(norm.length))) return true;
+    if (norm.startsWith(normCand) && /^\d{0,4}$/.test(norm.slice(normCand.length))) return true;
   }
   return false;
 }

@@ -22,9 +22,10 @@ function areTitlesMatching(searchTitle: string, candidateTitle: string): boolean
   const c = cleanTitle(candidateTitle);
   if (!s || !c) return false;
   if (s === c) return true;
-  if (c.startsWith(s) && (c.length - s.length <= 15)) return true;
-  if (s.startsWith(c) && (s.length - c.length <= 10)) return true;
-  if (c.includes(s) || s.includes(c)) return true;
+  // Tolérer un suffixe court (saison, numéro, année) mais pas un autre mot collé.
+  // "sherlock" ne doit pas matcher "sherlockdaughter".
+  if (c.startsWith(s) && (c.length - s.length <= 6)) return true;
+  if (s.startsWith(c) && (s.length - c.length <= 6)) return true;
   return false;
 }
 
